@@ -1,6 +1,6 @@
-# Retinex CLI
+# Retinex
 
-Reference implementation of single-scale and multi-scale Retinex image enhancement with color restoration (MSRCR).
+A reference implementation of single-scale and multi-scale Retinex image enhancement with color restoration (MSRCR).
 
 ## Prerequisites
 
