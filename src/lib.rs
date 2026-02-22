@@ -342,6 +342,35 @@ fn normalize_reflectance_for_display(image: &Rgb32FImage) -> RgbImage {
     normalize_reflectance(image)
 }
 
+/// Clamp reflectance to physical constraint (reflectance <= 1.0 in linear space)
+/// This means log-reflectance <= 0
+/// If max reflectance > 0, shift everything down and add to illumination
+pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32FImage) {
+    // Find max reflectance across all channels
+    let mut max_refl = f32::NEG_INFINITY;
+    for pixel in reflectance.pixels() {
+        for channel in 0..3 {
+            if pixel.0[channel] > max_refl {
+                max_refl = pixel.0[channel];
+            }
+        }
+    }
+
+    // If max > 0, we need to clamp by shifting
+    if max_refl > 0.0 {
+        for y in 0..reflectance.height() {
+            for x in 0..reflectance.width() {
+                for channel in 0..3 {
+                    let r = reflectance.get_pixel(x, y).0[channel];
+                    let l = illumination.get_pixel(x, y).0[channel];
+                    reflectance.get_pixel_mut(x, y).0[channel] = r - max_refl;
+                    illumination.get_pixel_mut(x, y).0[channel] = l + max_refl;
+                }
+            }
+        }
+    }
+}
+
 /// Per-channel normalization (for comparison - causes grayscale effect)
 pub fn normalize_per_channel(image: &Rgb32FImage) -> RgbImage {
     let (width, height) = image.dimensions();
