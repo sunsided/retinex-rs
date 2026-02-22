@@ -1,0 +1,5 @@
+refl.jpg filter=lfs diff=lfs merge=lfs -text
+color.jpg filter=lfs diff=lfs merge=lfs -text
+light.jpg filter=lfs diff=lfs merge=lfs -text
+msr.jpg filter=lfs diff=lfs merge=lfs -text
+out.jpg filter=lfs diff=lfs merge=lfs -text
