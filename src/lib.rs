@@ -23,6 +23,7 @@ impl std::error::Error for RetinexError {}
 pub type RetinexResult<T> = Result<T, RetinexError>;
 
 /// Output from Retinex processing containing both reflectance and illumination
+/// All values are in [0, 1] range (reflectance is in log-domain, not linear)
 #[derive(Debug, Clone)]
 pub struct RetinexOutput {
     /// The estimated reflectance (log-domain, unnormalized)
@@ -72,8 +73,6 @@ pub fn multi_scale_retinex_full(
 pub fn single_scale_retinex_color_restored(
     image: &DynamicImage,
     sigma: f32,
-    gain: f32,
-    offset: f32,
 ) -> RetinexResult<RgbImage> {
     if sigma <= 0.0 {
         return Err(RetinexError::InvalidSigma(sigma));
@@ -81,16 +80,14 @@ pub fn single_scale_retinex_color_restored(
 
     let rgb = image.to_rgb32f();
     let (reflectance, _) = ssr_rgb32f_with_illumination(&rgb, sigma);
-    let color_restored = apply_color_restoration(&reflectance, &rgb, gain, offset);
-    Ok(float_to_rgb8_scaled(&color_restored))
+    let color_restored = apply_color_restoration(&reflectance, &rgb);
+    Ok(float_to_rgb8(&color_restored))
 }
 
 /// Multi-scale Retinex with color restoration (MSRCR)
 pub fn multi_scale_retinex_color_restored(
     image: &DynamicImage,
     sigmas: &[f32],
-    gain: f32,
-    offset: f32,
 ) -> RetinexResult<RgbImage> {
     if sigmas.is_empty() {
         return Err(RetinexError::EmptySigmaSet);
@@ -102,20 +99,20 @@ pub fn multi_scale_retinex_color_restored(
 
     let rgb = image.to_rgb32f();
     let (reflectance, _) = msr_rgb32f_with_illumination(&rgb, sigmas);
-    let color_restored = apply_color_restoration(&reflectance, &rgb, gain, offset);
-    Ok(float_to_rgb8_scaled(&color_restored))
+    let color_restored = apply_color_restoration(&reflectance, &rgb);
+    Ok(float_to_rgb8(&color_restored))
 }
 
 /// Legacy single-scale Retinex (returns normalized 8-bit image)
 pub fn single_scale_retinex(image: &DynamicImage, sigma: f32) -> RetinexResult<RgbImage> {
     let output = single_scale_retinex_full(image, sigma)?;
-    Ok(normalize_reflectance_for_display(&output.reflectance))
+    Ok(normalize_reflectance(&output.reflectance))
 }
 
 /// Legacy multi-scale Retinex (returns normalized 8-bit image)
 pub fn multi_scale_retinex(image: &DynamicImage, sigmas: &[f32]) -> RetinexResult<RgbImage> {
     let output = multi_scale_retinex_full(image, sigmas)?;
-    Ok(normalize_reflectance_for_display(&output.reflectance))
+    Ok(normalize_reflectance(&output.reflectance))
 }
 
 /// Extract illumination at a specific scale - returns visible image
@@ -140,8 +137,8 @@ pub fn extract_illumination(image: &DynamicImage, sigma: f32) -> RetinexResult<R
         }
     }
 
-    // Illumination is in [0, 1] range, scale to [0, 255]
-    Ok(float_to_rgb8_scaled(&illumination))
+    // Illumination is already in [0, 1] range
+    Ok(float_to_rgb8(&illumination))
 }
 
 fn ssr_rgb32f_with_illumination(image: &Rgb32FImage, sigma: f32) -> (Rgb32FImage, Rgb32FImage) {
@@ -163,9 +160,6 @@ fn ssr_rgb32f_with_illumination(image: &Rgb32FImage, sigma: f32) -> (Rgb32FImage
 
                 // Compute reflectance in log domain
                 // log(I) - log(L) = log(I/L)
-                // When I ≈ L (smooth areas), result ≈ 0
-                // When I > L (details), result > 0
-                // When I < L (shadows), result < 0
                 let value = (i + EPSILON).ln() - (l + EPSILON).ln();
                 reflectance.get_pixel_mut(x, y).0[channel] = value;
             }
@@ -213,18 +207,12 @@ fn msr_rgb32f_with_illumination(image: &Rgb32FImage, sigmas: &[f32]) -> (Rgb32FI
 }
 
 /// Apply color restoration to prevent grayscale output (MSRCR)
-/// Formula: R_final = R_msr * (I_c / sum(I)) * 3
-/// The factor of 3 normalizes the color weights (since sum of ratios = 1)
-fn apply_color_restoration(
-    reflectance: &Rgb32FImage,
-    original: &Rgb32FImage,
-    _gain: f32,
-    _offset: f32,
-) -> Rgb32FImage {
+/// Returns image in [0, 1] range
+fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) -> Rgb32FImage {
     let (width, height) = reflectance.dimensions();
     let mut result = Rgb32FImage::new(width, height);
 
-    // First, normalize reflectance to [0, 1] using percentile clipping
+    // Normalize reflectance to [0, 1] using percentile clipping
     let mut all_refl: Vec<f32> = reflectance
         .pixels()
         .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
@@ -242,8 +230,6 @@ fn apply_color_restoration(
         for x in 0..width {
             let r = reflectance.get_pixel(x, y);
             let orig = original.get_pixel(x, y);
-
-            // Sum of original channels for color restoration factor
             let sum_orig: f32 = orig.0.iter().sum::<f32>().max(EPSILON);
 
             for channel in 0..3 {
@@ -252,12 +238,11 @@ fn apply_color_restoration(
                 let norm_refl = (clipped - low_val) / refl_range;
 
                 // Color restoration factor: channel_value / sum * 3
-                // The *3 compensates for dividing by sum of 3 channels
                 let color_factor = (orig.0[channel] / sum_orig) * 3.0;
 
-                // Apply color restoration and scale to [0, 255]
-                let restored = norm_refl * color_factor * 255.0;
-                result.get_pixel_mut(x, y).0[channel] = restored.clamp(0.0, 255.0);
+                // Result in [0, 1] range
+                let restored = norm_refl * color_factor;
+                result.get_pixel_mut(x, y).0[channel] = restored.clamp(0.0, 1.0);
             }
         }
     }
@@ -279,31 +264,13 @@ fn extract_channel(image: &Rgb32FImage, channel: usize) -> ImageBuffer<Luma<f32>
     buffer
 }
 
-/// Normalize reflectance for display
-/// Reflectance is in log domain (typically -5 to +5 range)
-/// We need to map this to [0, 255] for visualization
-/// Uses percentile clipping to handle outliers
+/// Normalize reflectance for display using percentile clipping
+/// Input: log-domain reflectance (any range)
+/// Output: 8-bit RGB image
 pub fn normalize_reflectance(image: &Rgb32FImage) -> RgbImage {
     let (width, height) = image.dimensions();
 
-    // Find global min/max across all channels
-    let mut min_val = f32::INFINITY;
-    let mut max_val = f32::NEG_INFINITY;
-
-    for pixel in image.pixels() {
-        for channel in 0..3 {
-            let v = pixel.0[channel];
-            if v < min_val {
-                min_val = v;
-            }
-            if v > max_val {
-                max_val = v;
-            }
-        }
-    }
-
-    // Use percentile-based clipping to handle outliers
-    // Collect all values to compute percentiles
+    // Collect all values for percentile computation
     let mut all_values: Vec<f32> = image
         .pixels()
         .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
@@ -311,11 +278,10 @@ pub fn normalize_reflectance(image: &Rgb32FImage) -> RgbImage {
     all_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let n = all_values.len();
-    let low_idx = (n as f32 * 0.02) as usize; // 2nd percentile
-    let high_idx = (n as f32 * 0.98) as usize; // 98th percentile
+    let low_idx = (n as f32 * 0.02) as usize;
+    let high_idx = (n as f32 * 0.98) as usize;
     let low_val = all_values[low_idx.min(n - 1)];
     let high_val = all_values[high_idx.min(n - 1)];
-
     let range = (high_val - low_val).max(EPSILON);
 
     let mut output = RgbImage::new(width, height);
@@ -325,10 +291,9 @@ pub fn normalize_reflectance(image: &Rgb32FImage) -> RgbImage {
             let mut normalized = [0u8; 3];
 
             for channel in 0..3 {
-                // Clip to percentile range then map to [0, 255]
                 let clipped = source.0[channel].clamp(low_val, high_val);
                 let scaled = (clipped - low_val) / range;
-                normalized[channel] = (scaled.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                normalized[channel] = (scaled * 255.0 + 0.5) as u8;
             }
 
             output.put_pixel(x, y, Rgb(normalized));
@@ -338,37 +303,22 @@ pub fn normalize_reflectance(image: &Rgb32FImage) -> RgbImage {
     output
 }
 
-fn normalize_reflectance_for_display(image: &Rgb32FImage) -> RgbImage {
-    normalize_reflectance(image)
-}
+/// Convert float image in [0, 1] range to 8-bit RGB
+fn float_to_rgb8(image: &Rgb32FImage) -> RgbImage {
+    let (width, height) = image.dimensions();
+    let mut output = RgbImage::new(width, height);
 
-/// Clamp reflectance to physical constraint (reflectance <= 1.0 in linear space)
-/// This means log-reflectance <= 0
-/// If max reflectance > 0, shift everything down and add to illumination
-pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32FImage) {
-    // Find max reflectance across all channels
-    let mut max_refl = f32::NEG_INFINITY;
-    for pixel in reflectance.pixels() {
-        for channel in 0..3 {
-            if pixel.0[channel] > max_refl {
-                max_refl = pixel.0[channel];
-            }
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = image.get_pixel(x, y);
+            let r = (pixel.0[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            let g = (pixel.0[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            let b = (pixel.0[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            output.put_pixel(x, y, Rgb([r, g, b]));
         }
     }
 
-    // If max > 0, we need to clamp by shifting
-    if max_refl > 0.0 {
-        for y in 0..reflectance.height() {
-            for x in 0..reflectance.width() {
-                for channel in 0..3 {
-                    let r = reflectance.get_pixel(x, y).0[channel];
-                    let l = illumination.get_pixel(x, y).0[channel];
-                    reflectance.get_pixel_mut(x, y).0[channel] = r - max_refl;
-                    illumination.get_pixel_mut(x, y).0[channel] = l + max_refl;
-                }
-            }
-        }
-    }
+    output
 }
 
 /// Per-channel normalization (for comparison - causes grayscale effect)
@@ -406,7 +356,7 @@ pub fn normalize_per_channel(image: &Rgb32FImage) -> RgbImage {
                     (value - min) / (max - min)
                 };
 
-                normalized[channel] = (scaled.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                normalized[channel] = (scaled * 255.0 + 0.5) as u8;
             }
 
             output.put_pixel(x, y, Rgb(normalized));
@@ -416,34 +366,29 @@ pub fn normalize_per_channel(image: &Rgb32FImage) -> RgbImage {
     output
 }
 
-/// Convert float image [0, 1] or [0, 255] to 8-bit RGB, scaling appropriately
-fn float_to_rgb8_scaled(image: &Rgb32FImage) -> RgbImage {
-    let (width, height) = image.dimensions();
-
-    // Detect if image is in [0, 1] or [0, 255] range by checking max value
-    let max_val = image
-        .pixels()
-        .flat_map(|p| p.0.iter().copied())
-        .fold(0.0f32, |a, b| a.max(b));
-
-    let scale = if max_val <= 1.5 {
-        // Input is in [0, 1] range, scale to [0, 255]
-        255.0
-    } else {
-        // Input is already in [0, 255] range or higher
-        1.0
-    };
-
-    let mut output = RgbImage::new(width, height);
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = image.get_pixel(x, y);
-            let r = (pixel.0[0] * scale).clamp(0.0, 255.0) as u8;
-            let g = (pixel.0[1] * scale).clamp(0.0, 255.0) as u8;
-            let b = (pixel.0[2] * scale).clamp(0.0, 255.0) as u8;
-            output.put_pixel(x, y, Rgb([r, g, b]));
+/// Clamp reflectance to physical constraint (reflectance <= 1.0 in linear space)
+/// This means log-reflectance <= 0
+/// If max reflectance > 0, shift everything down and add to illumination
+pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32FImage) {
+    let mut max_refl = f32::NEG_INFINITY;
+    for pixel in reflectance.pixels() {
+        for channel in 0..3 {
+            if pixel.0[channel] > max_refl {
+                max_refl = pixel.0[channel];
+            }
         }
     }
 
-    output
+    if max_refl > 0.0 {
+        for y in 0..reflectance.height() {
+            for x in 0..reflectance.width() {
+                for channel in 0..3 {
+                    let r = reflectance.get_pixel(x, y).0[channel];
+                    let l = illumination.get_pixel(x, y).0[channel];
+                    reflectance.get_pixel_mut(x, y).0[channel] = r - max_refl;
+                    illumination.get_pixel_mut(x, y).0[channel] = (l + max_refl).clamp(0.0, 1.0);
+                }
+            }
+        }
+    }
 }

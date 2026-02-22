@@ -191,6 +191,42 @@ Multi-scale Retinex averages multiple scales to balance local and global contras
 - `--illumination <path>`: Save illumination component to file
 - `--reflectance <path>`: Save raw reflectance to file
 
+### Multi-Scale Mode (`--mode multi`)
+
+Multi-scale Retinex computes the reflectance at multiple Gaussian blur scales and averages the results. This balances local detail enhancement (small sigma) with global illumination correction (large sigma).
+
+**How it works:**
+```
+R_multi = (R_σ1 + R_σ2 + ... + R_σn) / n
+```
+
+Where each `R_σ` is the reflectance computed with a different sigma value.
+
+**Selecting sigma values:**
+
+A good default set is `15,80,250`:
+- `15`: Fine details, edges, textures
+- `80`: Medium-scale features, local contrast
+- `250`: Large-scale illumination variations, global tone
+
+You can use fewer or more scales depending on the image:
+- Fast processing: `--sigmas 30,150`
+- High quality: `--sigmas 10,40,100,250`
+
+**What happens if you specify multiple sigmas without `--mode multi`?**
+
+Only the **first sigma value** is used. The rest are ignored:
+
+```bash
+# This uses only sigma=15 (single-scale mode)
+retinex input.jpg output.jpg --sigmas 15,80,250
+
+# This uses all three sigmas (multi-scale mode)
+retinex input.jpg output.jpg --mode multi --sigmas 15,80,250
+```
+
+The `--mode` flag determines whether multiple sigmas are averaged (`multi`) or if only the first is used (`single`).
+
 ## Technical Details
 
 ### Normalization

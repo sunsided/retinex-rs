@@ -122,8 +122,8 @@ fn main() {
     // Process the main output
     let result = if cli.color_restore {
         match cli.mode {
-            Mode::Single => single_scale_retinex_color_restored(&image, cli.sigmas[0], 0.0, 0.0),
-            Mode::Multi => multi_scale_retinex_color_restored(&image, &cli.sigmas, 0.0, 0.0),
+            Mode::Single => single_scale_retinex_color_restored(&image, cli.sigmas[0]),
+            Mode::Multi => multi_scale_retinex_color_restored(&image, &cli.sigmas),
         }
     } else {
         match cli.mode {
