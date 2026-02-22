@@ -40,7 +40,7 @@
 //! use retinex::{multi_scale_retinex_color_restored, single_scale_retinex};
 //!
 //! // Single-scale (grayscale output)
-//! let image = image::open("input.jpg").unwrap();
+//! let image = image::open("images/house.jpg").unwrap();
 //! let result = single_scale_retinex(&image, 15.0).unwrap();
 //! result.save("output.jpg").unwrap();
 //!
@@ -129,7 +129,7 @@ pub struct RetinexOutput {
 /// ```rust,no_run
 /// use retinex::single_scale_retinex_full;
 ///
-/// let image = image::open("input.jpg").unwrap();
+/// let image = image::open("images/house.jpg").unwrap();
 /// let output = single_scale_retinex_full(&image, 15.0).unwrap();
 ///
 /// // Access raw components
@@ -175,7 +175,7 @@ pub fn single_scale_retinex_full(image: &DynamicImage, sigma: f32) -> RetinexRes
 /// ```rust,no_run
 /// use retinex::multi_scale_retinex_full;
 ///
-/// let image = image::open("input.jpg").unwrap();
+/// let image = image::open("images/house.jpg").unwrap();
 /// let output = multi_scale_retinex_full(&image, &[15.0, 80.0, 250.0]).unwrap();
 /// ```
 pub fn multi_scale_retinex_full(
@@ -254,7 +254,7 @@ pub fn single_scale_retinex_color_restored(
 /// ```rust,no_run
 /// use retinex::multi_scale_retinex_color_restored;
 ///
-/// let image = image::open("input.jpg").unwrap();
+/// let image = image::open("images/house.jpg").unwrap();
 /// let result = multi_scale_retinex_color_restored(
 ///     &image,
 ///     &[15.0, 80.0, 250.0]
@@ -383,7 +383,7 @@ pub fn extract_illumination(image: &DynamicImage, sigma: f32) -> RetinexResult<R
 /// ```rust,no_run
 /// use retinex::{single_scale_retinex_full, normalize_reflectance};
 ///
-/// let image = image::open("input.jpg").unwrap();
+/// let image = image::open("images/house.jpg").unwrap();
 /// let output = single_scale_retinex_full(&image, 15.0).unwrap();
 /// let display = normalize_reflectance(&output.reflectance);
 /// ```
@@ -643,4 +643,167 @@ fn float_to_rgb8(image: &Rgb32FImage) -> RgbImage {
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::GenericImageView;
+
+    fn load_test_image() -> DynamicImage {
+        image::open("images/house.jpg").expect("Failed to load test image")
+    }
+
+    #[test]
+    fn test_single_scale_retinex_basic() {
+        let img = load_test_image();
+        let result = single_scale_retinex(&img, 15.0);
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_multi_scale_retinex_basic() {
+        let img = load_test_image();
+        // Use smaller sigmas for faster tests
+        let result = multi_scale_retinex(&img, &[10.0, 40.0]);
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_color_restored_single_scale() {
+        let img = load_test_image();
+        let result = single_scale_retinex_color_restored(&img, 15.0);
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_color_restored_multi_scale() {
+        let img = load_test_image();
+        // Use smaller sigmas for faster tests
+        let result = multi_scale_retinex_color_restored(&img, &[10.0, 40.0]);
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_extract_illumination() {
+        let img = load_test_image();
+        let result = extract_illumination(&img, 15.0);
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_single_scale_full_output() {
+        let img = load_test_image();
+        let result = single_scale_retinex_full(&img, 15.0);
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.reflectance.dimensions(), img.dimensions());
+        assert_eq!(output.illumination.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_multi_scale_full_output() {
+        let img = load_test_image();
+        // Use smaller sigmas for faster tests
+        let result = multi_scale_retinex_full(&img, &[10.0, 40.0]);
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert_eq!(output.reflectance.dimensions(), img.dimensions());
+        assert_eq!(output.illumination.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_invalid_sigma_single_scale() {
+        let img = load_test_image();
+        let result = single_scale_retinex(&img, -5.0);
+        assert!(matches!(result, Err(RetinexError::InvalidSigma(-5.0))));
+    }
+
+    #[test]
+    fn test_invalid_sigma_multi_scale() {
+        let img = load_test_image();
+        let result = multi_scale_retinex(&img, &[10.0, -5.0, 40.0]);
+        assert!(matches!(result, Err(RetinexError::InvalidSigma(-5.0))));
+    }
+
+    #[test]
+    fn test_empty_sigma_set() {
+        let img = load_test_image();
+        let result = multi_scale_retinex(&img, &[]);
+        assert!(matches!(result, Err(RetinexError::EmptySigmaSet)));
+    }
+
+    #[test]
+    fn test_normalize_reflectance() {
+        let img = load_test_image();
+        let rgb = img.to_rgb32f();
+        let output = normalize_reflectance(&rgb);
+        assert_eq!(output.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_normalize_per_channel() {
+        let img = load_test_image();
+        let rgb = img.to_rgb32f();
+        let output = normalize_per_channel(&rgb);
+        assert_eq!(output.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_clamp_reflectance() {
+        let img = load_test_image();
+        let mut output = single_scale_retinex_full(&img, 15.0).unwrap();
+
+        // Store original max reflectance
+        let original_max = output
+            .reflectance
+            .pixels()
+            .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+
+        clamp_reflectance(&mut output.reflectance, &mut output.illumination);
+
+        // After clamping, max reflectance should be <= 0
+        let new_max = output
+            .reflectance
+            .pixels()
+            .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+
+        assert!(new_max <= 0.0 || original_max <= 0.0);
+    }
+
+    #[test]
+    fn test_illumination_range() {
+        let img = load_test_image();
+        let output = single_scale_retinex_full(&img, 15.0).unwrap();
+
+        // Illumination should be in [0, 1] range
+        for pixel in output.illumination.pixels() {
+            for channel in 0..3 {
+                assert!(
+                    pixel.0[channel] >= 0.0 && pixel.0[channel] <= 1.0,
+                    "Illumination value {} out of range [0, 1]",
+                    pixel.0[channel]
+                );
+            }
+        }
+    }
 }
