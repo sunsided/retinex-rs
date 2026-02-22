@@ -63,6 +63,9 @@
 use image::{DynamicImage, ImageBuffer, Luma, Rgb, Rgb32FImage, RgbImage};
 use imageproc::filter::gaussian_blur_f32;
 
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
+
 const EPSILON: f32 = 1e-6;
 
 /// Errors that can occur during Retinex processing
@@ -394,7 +397,15 @@ pub fn normalize_reflectance(image: &Rgb32FImage) -> RgbImage {
         .pixels()
         .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
         .collect();
-    all_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    #[cfg(feature = "rayon")]
+    {
+        all_values.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        all_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    }
 
     let n = all_values.len();
     let low_idx = (n as f32 * 0.02) as usize;
@@ -404,18 +415,47 @@ pub fn normalize_reflectance(image: &Rgb32FImage) -> RgbImage {
     let range = (high_val - low_val).max(EPSILON);
 
     let mut output = RgbImage::new(width, height);
-    for y in 0..height {
-        for x in 0..width {
-            let source = image.get_pixel(x, y);
-            let mut normalized = [0u8; 3];
 
-            for channel in 0..3 {
-                let clipped = source.0[channel].clamp(low_val, high_val);
-                let scaled = (clipped - low_val) / range;
-                normalized[channel] = (scaled * 255.0 + 0.5) as u8;
+    #[cfg(feature = "rayon")]
+    {
+        let rows: Vec<_> = (0..height)
+            .into_par_iter()
+            .map(|y| {
+                let mut row_pixels = vec![[0u8; 3]; width as usize];
+                for x in 0..width {
+                    let source = image.get_pixel(x, y);
+                    for channel in 0..3 {
+                        let clipped = source.0[channel].clamp(low_val, high_val);
+                        let scaled = (clipped - low_val) / range;
+                        row_pixels[x as usize][channel] = (scaled * 255.0 + 0.5) as u8;
+                    }
+                }
+                (y, row_pixels)
+            })
+            .collect();
+
+        for (y, row_data) in rows {
+            for x in 0..width {
+                output.put_pixel(x, y, Rgb(row_data[x as usize]));
             }
+        }
+    }
 
-            output.put_pixel(x, y, Rgb(normalized));
+    #[cfg(not(feature = "rayon"))]
+    {
+        for y in 0..height {
+            for x in 0..width {
+                let source = image.get_pixel(x, y);
+                let mut normalized = [0u8; 3];
+
+                for channel in 0..3 {
+                    let clipped = source.0[channel].clamp(low_val, high_val);
+                    let scaled = (clipped - low_val) / range;
+                    normalized[channel] = (scaled * 255.0 + 0.5) as u8;
+                }
+
+                output.put_pixel(x, y, Rgb(normalized));
+            }
         }
     }
 
@@ -437,42 +477,114 @@ pub fn normalize_reflectance(image: &Rgb32FImage) -> RgbImage {
 /// Returns an 8-bit RGB image with grayscale appearance.
 pub fn normalize_per_channel(image: &Rgb32FImage) -> RgbImage {
     let (width, height) = image.dimensions();
-    let mut min_vals = [f32::INFINITY; 3];
-    let mut max_vals = [f32::NEG_INFINITY; 3];
 
-    for pixel in image.pixels() {
-        for channel in 0..3 {
-            let value = pixel.0[channel];
-            if value < min_vals[channel] {
-                min_vals[channel] = value;
+    #[cfg(feature = "rayon")]
+    let (min_vals, max_vals): ([f32; 3], [f32; 3]) = {
+        let channel_stats: Vec<_> = (0..3)
+            .into_par_iter()
+            .map(|channel| {
+                let mut min_val = f32::INFINITY;
+                let mut max_val = f32::NEG_INFINITY;
+                for pixel in image.pixels() {
+                    let value = pixel.0[channel];
+                    if value < min_val {
+                        min_val = value;
+                    }
+                    if value > max_val {
+                        max_val = value;
+                    }
+                }
+                (channel, min_val, max_val)
+            })
+            .collect();
+
+        let mut min_vals = [f32::INFINITY; 3];
+        let mut max_vals = [f32::NEG_INFINITY; 3];
+        for (channel, min_val, max_val) in channel_stats {
+            min_vals[channel] = min_val;
+            max_vals[channel] = max_val;
+        }
+        (min_vals, max_vals)
+    };
+
+    #[cfg(not(feature = "rayon"))]
+    let (min_vals, max_vals): ([f32; 3], [f32; 3]) = {
+        let mut min_vals = [f32::INFINITY; 3];
+        let mut max_vals = [f32::NEG_INFINITY; 3];
+
+        for pixel in image.pixels() {
+            for channel in 0..3 {
+                let value = pixel.0[channel];
+                if value < min_vals[channel] {
+                    min_vals[channel] = value;
+                }
+                if value > max_vals[channel] {
+                    max_vals[channel] = value;
+                }
             }
-            if value > max_vals[channel] {
-                max_vals[channel] = value;
+        }
+        (min_vals, max_vals)
+    };
+
+    let mut output = RgbImage::new(width, height);
+
+    #[cfg(feature = "rayon")]
+    {
+        let rows: Vec<_> = (0..height)
+            .into_par_iter()
+            .map(|y| {
+                let mut row_pixels = vec![[0u8; 3]; width as usize];
+                for x in 0..width {
+                    let source = image.get_pixel(x, y);
+
+                    for channel in 0..3 {
+                        let min = min_vals[channel];
+                        let max = max_vals[channel];
+                        let value = source.0[channel];
+
+                        let scaled = if (max - min).abs() < EPSILON {
+                            0.0
+                        } else {
+                            (value - min) / (max - min)
+                        };
+
+                        row_pixels[x as usize][channel] = (scaled * 255.0 + 0.5) as u8;
+                    }
+                }
+                (y, row_pixels)
+            })
+            .collect();
+
+        for (y, row_data) in rows {
+            for x in 0..width {
+                output.put_pixel(x, y, Rgb(row_data[x as usize]));
             }
         }
     }
 
-    let mut output = RgbImage::new(width, height);
-    for y in 0..height {
-        for x in 0..width {
-            let source = image.get_pixel(x, y);
-            let mut normalized = [0u8; 3];
+    #[cfg(not(feature = "rayon"))]
+    {
+        for y in 0..height {
+            for x in 0..width {
+                let source = image.get_pixel(x, y);
+                let mut normalized = [0u8; 3];
 
-            for channel in 0..3 {
-                let min = min_vals[channel];
-                let max = max_vals[channel];
-                let value = source.0[channel];
+                for channel in 0..3 {
+                    let min = min_vals[channel];
+                    let max = max_vals[channel];
+                    let value = source.0[channel];
 
-                let scaled = if (max - min).abs() < EPSILON {
-                    0.0
-                } else {
-                    (value - min) / (max - min)
-                };
+                    let scaled = if (max - min).abs() < EPSILON {
+                        0.0
+                    } else {
+                        (value - min) / (max - min)
+                    };
 
-                normalized[channel] = (scaled * 255.0 + 0.5) as u8;
+                    normalized[channel] = (scaled * 255.0 + 0.5) as u8;
+                }
+
+                output.put_pixel(x, y, Rgb(normalized));
             }
-
-            output.put_pixel(x, y, Rgb(normalized));
         }
     }
 
@@ -492,23 +604,58 @@ pub fn normalize_per_channel(image: &Rgb32FImage) -> RgbImage {
 /// * `reflectance` - Log-domain reflectance (modified in place)
 /// * `illumination` - Illumination component (modified in place)
 pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32FImage) {
-    let mut max_refl = f32::NEG_INFINITY;
-    for pixel in reflectance.pixels() {
-        for channel in 0..3 {
-            if pixel.0[channel] > max_refl {
-                max_refl = pixel.0[channel];
+    #[cfg(feature = "rayon")]
+    let max_refl: f32 = {
+        reflectance
+            .pixels()
+            .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
+            .par_bridge()
+            .reduce(|| f32::NEG_INFINITY, |a, b| a.max(b))
+    };
+
+    #[cfg(not(feature = "rayon"))]
+    let max_refl: f32 = {
+        let mut max_refl = f32::NEG_INFINITY;
+        for pixel in reflectance.pixels() {
+            for channel in 0..3 {
+                if pixel.0[channel] > max_refl {
+                    max_refl = pixel.0[channel];
+                }
             }
         }
-    }
+        max_refl
+    };
 
     if max_refl > 0.0 {
-        for y in 0..reflectance.height() {
-            for x in 0..reflectance.width() {
-                for channel in 0..3 {
-                    let r = reflectance.get_pixel(x, y).0[channel];
-                    let l = illumination.get_pixel(x, y).0[channel];
-                    reflectance.get_pixel_mut(x, y).0[channel] = r - max_refl;
-                    illumination.get_pixel_mut(x, y).0[channel] = (l + max_refl).clamp(0.0, 1.0);
+        #[cfg(feature = "rayon")]
+        {
+            let refl_data: Vec<_> = reflectance.pixels_mut().collect();
+            let illum_data: Vec<_> = illumination.pixels_mut().collect();
+
+            refl_data
+                .into_par_iter()
+                .zip(illum_data.into_par_iter())
+                .for_each(|(refl_pixel, illum_pixel)| {
+                    for channel in 0..3 {
+                        let r = refl_pixel.0[channel];
+                        let l = illum_pixel.0[channel];
+                        refl_pixel.0[channel] = r - max_refl;
+                        illum_pixel.0[channel] = (l + max_refl).clamp(0.0, 1.0);
+                    }
+                });
+        }
+
+        #[cfg(not(feature = "rayon"))]
+        {
+            for y in 0..height {
+                for x in 0..width {
+                    for channel in 0..3 {
+                        let r = reflectance.get_pixel(x, y).0[channel];
+                        let l = illumination.get_pixel(x, y).0[channel];
+                        reflectance.get_pixel_mut(x, y).0[channel] = r - max_refl;
+                        illumination.get_pixel_mut(x, y).0[channel] =
+                            (l + max_refl).clamp(0.0, 1.0);
+                    }
                 }
             }
         }
@@ -522,18 +669,58 @@ fn ssr_rgb32f_with_illumination(image: &Rgb32FImage, sigma: f32) -> (Rgb32FImage
     let mut reflectance = Rgb32FImage::new(width, height);
     let mut illumination = Rgb32FImage::new(width, height);
 
-    for channel in 0..3 {
-        let channel_image = extract_channel(image, channel);
-        let blurred = gaussian_blur_f32(&channel_image, sigma);
+    #[cfg(feature = "rayon")]
+    {
+        let channels: Vec<_> = (0..3)
+            .into_par_iter()
+            .map(|channel| {
+                let channel_image = extract_channel(image, channel);
+                let blurred = gaussian_blur_f32(&channel_image, sigma);
 
-        for y in 0..height {
-            for x in 0..width {
-                let i = channel_image.get_pixel(x, y)[0];
-                let l = blurred.get_pixel(x, y)[0];
+                let mut refl_channel = vec![0.0f32; (width * height) as usize];
+                let mut illum_channel = vec![0.0f32; (width * height) as usize];
 
-                illumination.get_pixel_mut(x, y).0[channel] = l;
-                let value = (i + EPSILON).ln() - (l + EPSILON).ln();
-                reflectance.get_pixel_mut(x, y).0[channel] = value;
+                for y in 0..height {
+                    for x in 0..width {
+                        let i = channel_image.get_pixel(x, y)[0];
+                        let l = blurred.get_pixel(x, y)[0];
+
+                        let idx = (y * width + x) as usize;
+                        illum_channel[idx] = l;
+                        refl_channel[idx] = (i + EPSILON).ln() - (l + EPSILON).ln();
+                    }
+                }
+
+                (channel, refl_channel, illum_channel)
+            })
+            .collect();
+
+        for (channel, refl_data, illum_data) in channels {
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = (y * width + x) as usize;
+                    reflectance.get_pixel_mut(x, y).0[channel] = refl_data[idx];
+                    illumination.get_pixel_mut(x, y).0[channel] = illum_data[idx];
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    {
+        for channel in 0..3 {
+            let channel_image = extract_channel(image, channel);
+            let blurred = gaussian_blur_f32(&channel_image, sigma);
+
+            for y in 0..height {
+                for x in 0..width {
+                    let i = channel_image.get_pixel(x, y)[0];
+                    let l = blurred.get_pixel(x, y)[0];
+
+                    illumination.get_pixel_mut(x, y).0[channel] = l;
+                    let value = (i + EPSILON).ln() - (l + EPSILON).ln();
+                    reflectance.get_pixel_mut(x, y).0[channel] = value;
+                }
             }
         }
     }
@@ -543,39 +730,85 @@ fn ssr_rgb32f_with_illumination(image: &Rgb32FImage, sigma: f32) -> (Rgb32FImage
 
 fn msr_rgb32f_with_illumination(image: &Rgb32FImage, sigmas: &[f32]) -> (Rgb32FImage, Rgb32FImage) {
     let (width, height) = image.dimensions();
-    let mut reflectance_acc = Rgb32FImage::new(width, height);
-    let mut illumination_acc = Rgb32FImage::new(width, height);
 
-    for &sigma in sigmas {
-        let (reflectance, illumination) = ssr_rgb32f_with_illumination(image, sigma);
+    #[cfg(feature = "rayon")]
+    {
+        let results: Vec<_> = sigmas
+            .par_iter()
+            .map(|&sigma| ssr_rgb32f_with_illumination(image, sigma))
+            .collect();
 
-        for (acc_pixel, resp_pixel) in reflectance_acc.pixels_mut().zip(reflectance.pixels()) {
-            for channel in 0..3 {
-                acc_pixel.0[channel] += resp_pixel.0[channel];
+        let mut reflectance_acc = Rgb32FImage::new(width, height);
+        let mut illumination_acc = Rgb32FImage::new(width, height);
+
+        for (reflectance, illumination) in results {
+            for (acc_pixel, resp_pixel) in reflectance_acc.pixels_mut().zip(reflectance.pixels()) {
+                for channel in 0..3 {
+                    acc_pixel.0[channel] += resp_pixel.0[channel];
+                }
+            }
+
+            for (acc_pixel, illum_pixel) in illumination_acc.pixels_mut().zip(illumination.pixels())
+            {
+                for channel in 0..3 {
+                    acc_pixel.0[channel] += illum_pixel.0[channel];
+                }
             }
         }
 
-        for (acc_pixel, illum_pixel) in illumination_acc.pixels_mut().zip(illumination.pixels()) {
+        let weight = 1.0 / sigmas.len() as f32;
+        for pixel in reflectance_acc.pixels_mut() {
             for channel in 0..3 {
-                acc_pixel.0[channel] += illum_pixel.0[channel];
+                pixel.0[channel] *= weight;
             }
         }
-    }
 
-    let weight = 1.0 / sigmas.len() as f32;
-    for pixel in reflectance_acc.pixels_mut() {
-        for channel in 0..3 {
-            pixel.0[channel] *= weight;
+        for pixel in illumination_acc.pixels_mut() {
+            for channel in 0..3 {
+                pixel.0[channel] *= weight;
+            }
         }
+
+        (reflectance_acc, illumination_acc)
     }
 
-    for pixel in illumination_acc.pixels_mut() {
-        for channel in 0..3 {
-            pixel.0[channel] *= weight;
+    #[cfg(not(feature = "rayon"))]
+    {
+        let mut reflectance_acc = Rgb32FImage::new(width, height);
+        let mut illumination_acc = Rgb32FImage::new(width, height);
+
+        for &sigma in sigmas {
+            let (reflectance, illumination) = ssr_rgb32f_with_illumination(image, sigma);
+
+            for (acc_pixel, resp_pixel) in reflectance_acc.pixels_mut().zip(reflectance.pixels()) {
+                for channel in 0..3 {
+                    acc_pixel.0[channel] += resp_pixel.0[channel];
+                }
+            }
+
+            for (acc_pixel, illum_pixel) in illumination_acc.pixels_mut().zip(illumination.pixels())
+            {
+                for channel in 0..3 {
+                    acc_pixel.0[channel] += illum_pixel.0[channel];
+                }
+            }
         }
-    }
 
-    (reflectance_acc, illumination_acc)
+        let weight = 1.0 / sigmas.len() as f32;
+        for pixel in reflectance_acc.pixels_mut() {
+            for channel in 0..3 {
+                pixel.0[channel] *= weight;
+            }
+        }
+
+        for pixel in illumination_acc.pixels_mut() {
+            for channel in 0..3 {
+                pixel.0[channel] *= weight;
+            }
+        }
+
+        (reflectance_acc, illumination_acc)
+    }
 }
 
 fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) -> Rgb32FImage {
@@ -586,7 +819,15 @@ fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) ->
         .pixels()
         .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
         .collect();
-    all_refl.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    #[cfg(feature = "rayon")]
+    {
+        all_refl.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        all_refl.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    }
 
     let n = all_refl.len();
     let low_idx = (n as f32 * 0.02) as usize;
@@ -595,18 +836,51 @@ fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) ->
     let high_val = all_refl[high_idx.min(n - 1)];
     let refl_range = (high_val - low_val).max(EPSILON);
 
-    for y in 0..height {
-        for x in 0..width {
-            let r = reflectance.get_pixel(x, y);
-            let orig = original.get_pixel(x, y);
-            let sum_orig: f32 = orig.0.iter().sum::<f32>().max(EPSILON);
+    #[cfg(feature = "rayon")]
+    {
+        let rows: Vec<_> = (0..height)
+            .into_par_iter()
+            .map(|y| {
+                let mut row_result = vec![[0.0f32; 3]; width as usize];
+                for x in 0..width {
+                    let r = reflectance.get_pixel(x, y);
+                    let orig = original.get_pixel(x, y);
+                    let sum_orig: f32 = orig.0.iter().sum::<f32>().max(EPSILON);
 
-            for channel in 0..3 {
-                let clipped = r.0[channel].clamp(low_val, high_val);
-                let norm_refl = (clipped - low_val) / refl_range;
-                let color_factor = (orig.0[channel] / sum_orig) * 3.0;
-                let restored = norm_refl * color_factor;
-                result.get_pixel_mut(x, y).0[channel] = restored.clamp(0.0, 1.0);
+                    for channel in 0..3 {
+                        let clipped = r.0[channel].clamp(low_val, high_val);
+                        let norm_refl = (clipped - low_val) / refl_range;
+                        let color_factor = (orig.0[channel] / sum_orig) * 3.0;
+                        let restored = norm_refl * color_factor;
+                        row_result[x as usize][channel] = restored.clamp(0.0, 1.0);
+                    }
+                }
+                (y, row_result)
+            })
+            .collect();
+
+        for (y, row_data) in rows {
+            for x in 0..width {
+                result.get_pixel_mut(x, y).0 = row_data[x as usize];
+            }
+        }
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    {
+        for y in 0..height {
+            for x in 0..width {
+                let r = reflectance.get_pixel(x, y);
+                let orig = original.get_pixel(x, y);
+                let sum_orig: f32 = orig.0.iter().sum::<f32>().max(EPSILON);
+
+                for channel in 0..3 {
+                    let clipped = r.0[channel].clamp(low_val, high_val);
+                    let norm_refl = (clipped - low_val) / refl_range;
+                    let color_factor = (orig.0[channel] / sum_orig) * 3.0;
+                    let restored = norm_refl * color_factor;
+                    result.get_pixel_mut(x, y).0[channel] = restored.clamp(0.0, 1.0);
+                }
             }
         }
     }
