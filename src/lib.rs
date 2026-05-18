@@ -817,6 +817,27 @@ fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) ->
     let mut result = Rgb32FImage::new(width, height);
 
     // Pass 1: apply color factor to raw log-domain reflectance per pixel
+    #[cfg(feature = "rayon")]
+    let raw: Vec<[f32; 3]> = {
+        let n_pixels = (width * height) as usize;
+        (0..n_pixels)
+            .into_par_iter()
+            .map(|i| {
+                let x = (i as u32) % width;
+                let y = (i as u32) / width;
+                let r = reflectance.get_pixel(x, y);
+                let orig = original.get_pixel(x, y);
+                let sum_orig = orig.0.iter().sum::<f32>().max(EPSILON);
+                [
+                    r.0[0] * (orig.0[0] / sum_orig) * 3.0,
+                    r.0[1] * (orig.0[1] / sum_orig) * 3.0,
+                    r.0[2] * (orig.0[2] / sum_orig) * 3.0,
+                ]
+            })
+            .collect()
+    };
+
+    #[cfg(not(feature = "rayon"))]
     let raw: Vec<[f32; 3]> = reflectance
         .pixels()
         .zip(original.pixels())
@@ -850,6 +871,29 @@ fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) ->
     let refl_range = (high_val - low_val).max(EPSILON);
 
     // Pass 2: normalize using combined percentile bounds and write output
+    #[cfg(feature = "rayon")]
+    {
+        let rows: Vec<_> = (0..height)
+            .into_par_iter()
+            .map(|y| {
+                let mut row = vec![[0.0f32; 3]; width as usize];
+                for x in 0..width {
+                    let i = (y * width + x) as usize;
+                    for (ch, &val) in raw[i].iter().enumerate() {
+                        row[x as usize][ch] = (val.clamp(low_val, high_val) - low_val) / refl_range;
+                    }
+                }
+                (y, row)
+            })
+            .collect();
+        for (y, row_data) in rows {
+            for x in 0..width {
+                result.get_pixel_mut(x, y).0 = row_data[x as usize];
+            }
+        }
+    }
+
+    #[cfg(not(feature = "rayon"))]
     for (i, pixel_vals) in raw.iter().enumerate() {
         let x = (i as u32) % width;
         let y = (i as u32) / width;
