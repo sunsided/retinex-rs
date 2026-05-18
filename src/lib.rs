@@ -670,7 +670,8 @@ pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32
 ///
 /// Returns three sigma values `[fine, medium, coarse]` scaled proportionally
 /// to `min(width, height)`. Derived from the classic MSR defaults `[15, 80, 250]`
-/// calibrated for ~500 px images. Each value is clamped to at least `2.0`.
+/// calibrated for ~500 px images. Each value is clamped to at least `2.0`;
+/// for very small images (short side under ~13 px) some values may be equal.
 ///
 /// Pass the result directly to [`multi_scale_retinex`] or related functions:
 ///
@@ -1285,7 +1286,13 @@ mod tests {
 
     #[test]
     fn test_suggest_sigmas_ordered() {
-        for &(w, h) in &[(100u32, 100u32), (200, 100), (50, 800), (1920, 1080)] {
+        for &(w, h) in &[
+            (10u32, 10u32),
+            (100, 100),
+            (200, 100),
+            (50, 800),
+            (1920, 1080),
+        ] {
             let sigmas = suggest_sigmas_for_dimensions(w, h);
             assert!(
                 sigmas[0] <= sigmas[1],
