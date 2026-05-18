@@ -2,7 +2,7 @@ use clap::{Parser, ValueEnum};
 use retinex::{
     extract_illumination, multi_scale_retinex, multi_scale_retinex_color_restored,
     multi_scale_retinex_full, normalize_reflectance, single_scale_retinex,
-    single_scale_retinex_color_restored, single_scale_retinex_full,
+    single_scale_retinex_color_restored, single_scale_retinex_full, suggest_sigma, suggest_sigmas,
 };
 use std::path::PathBuf;
 
@@ -19,8 +19,12 @@ struct Cli {
     #[arg(short, long, value_enum, default_value = "single")]
     mode: Mode,
 
-    #[arg(long, value_delimiter = ',', default_value = "15.0")]
-    sigmas: Vec<f32>,
+    #[arg(long, value_delimiter = ',')]
+    sigmas: Option<Vec<f32>>,
+
+    /// Auto-select sigma values based on image dimensions (mutually exclusive with --sigmas)
+    #[arg(long, default_value_t = false)]
+    auto_sigmas: bool,
 
     /// Save the estimated illumination to a separate file
     #[arg(long)]
@@ -44,13 +48,8 @@ enum Mode {
 fn main() {
     let cli = Cli::parse();
 
-    if cli.sigmas.is_empty() {
-        eprintln!("Sigmas cannot be empty");
-        std::process::exit(1);
-    }
-
-    if let Some(&invalid) = cli.sigmas.iter().find(|&&sigma| sigma <= 0.0) {
-        eprintln!("Sigmas must be positive, got {invalid}");
+    if cli.auto_sigmas && cli.sigmas.is_some() {
+        eprintln!("Cannot use --sigmas and --auto-sigmas together");
         std::process::exit(1);
     }
 
@@ -62,16 +61,30 @@ fn main() {
         }
     };
 
+    let sigmas: Vec<f32> = if cli.auto_sigmas {
+        let selected = match cli.mode {
+            Mode::Single => vec![suggest_sigma(&image)],
+            Mode::Multi => suggest_sigmas(&image).to_vec(),
+        };
+        println!("Auto-selected sigmas: {selected:?}");
+        selected
+    } else if let Some(provided) = cli.sigmas {
+        if provided.is_empty() {
+            eprintln!("Sigmas cannot be empty");
+            std::process::exit(1);
+        }
+        if let Some(&invalid) = provided.iter().find(|&&sigma| sigma <= 0.0) {
+            eprintln!("Sigmas must be positive, got {invalid}");
+            std::process::exit(1);
+        }
+        provided
+    } else {
+        vec![15.0]
+    };
+
     // Save illumination if requested
     if let Some(illum_path) = &cli.illumination {
-        let illum_result = match cli.mode {
-            Mode::Single => extract_illumination(&image, cli.sigmas[0]),
-            Mode::Multi => {
-                // For multi-scale, use the first sigma for illumination visualization
-                // or we could average them - using first for simplicity
-                extract_illumination(&image, cli.sigmas[0])
-            }
-        };
+        let illum_result = extract_illumination(&image, sigmas[0]);
 
         match illum_result {
             Ok(illum) => {
@@ -95,11 +108,11 @@ fn main() {
     if let Some(refl_path) = &cli.reflectance {
         let refl_result = match cli.mode {
             Mode::Single => {
-                let output = single_scale_retinex_full(&image, cli.sigmas[0]);
+                let output = single_scale_retinex_full(&image, sigmas[0]);
                 output.map(|o| normalize_reflectance(&o.reflectance))
             }
             Mode::Multi => {
-                let output = multi_scale_retinex_full(&image, &cli.sigmas);
+                let output = multi_scale_retinex_full(&image, &sigmas);
                 output.map(|o| normalize_reflectance(&o.reflectance))
             }
         };
@@ -122,13 +135,13 @@ fn main() {
     // Process the main output
     let result = if cli.color_restore {
         match cli.mode {
-            Mode::Single => single_scale_retinex_color_restored(&image, cli.sigmas[0]),
-            Mode::Multi => multi_scale_retinex_color_restored(&image, &cli.sigmas),
+            Mode::Single => single_scale_retinex_color_restored(&image, sigmas[0]),
+            Mode::Multi => multi_scale_retinex_color_restored(&image, &sigmas),
         }
     } else {
         match cli.mode {
-            Mode::Single => single_scale_retinex(&image, cli.sigmas[0]),
-            Mode::Multi => multi_scale_retinex(&image, &cli.sigmas),
+            Mode::Single => single_scale_retinex(&image, sigmas[0]),
+            Mode::Multi => multi_scale_retinex(&image, &sigmas),
         }
     };
 
