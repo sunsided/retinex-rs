@@ -627,6 +627,8 @@ pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32
     };
 
     if max_refl > 0.0 {
+        let scale = max_refl.exp();
+
         #[cfg(feature = "rayon")]
         {
             let refl_data: Vec<_> = reflectance.pixels_mut().collect();
@@ -640,7 +642,7 @@ pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32
                         let r = refl_pixel.0[channel];
                         let l = illum_pixel.0[channel];
                         refl_pixel.0[channel] = r - max_refl;
-                        illum_pixel.0[channel] = (l + max_refl).clamp(0.0, 1.0);
+                        illum_pixel.0[channel] = (l * scale).clamp(0.0, 1.0);
                     }
                 });
         }
@@ -654,8 +656,7 @@ pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32
                         let r = reflectance.get_pixel(x, y).0[channel];
                         let l = illumination.get_pixel(x, y).0[channel];
                         reflectance.get_pixel_mut(x, y).0[channel] = r - max_refl;
-                        illumination.get_pixel_mut(x, y).0[channel] =
-                            (l + max_refl).clamp(0.0, 1.0);
+                        illumination.get_pixel_mut(x, y).0[channel] = (l * scale).clamp(0.0, 1.0);
                     }
                 }
             }
@@ -812,79 +813,125 @@ fn msr_rgb32f_with_illumination(image: &Rgb32FImage, sigmas: &[f32]) -> (Rgb32FI
     }
 }
 
+fn pixel_color_factor(r: &image::Rgb<f32>, orig: &image::Rgb<f32>) -> [f32; 3] {
+    let sum_orig = orig.0.iter().sum::<f32>().max(EPSILON);
+    [
+        r.0[0] * (orig.0[0] / sum_orig) * 3.0,
+        r.0[1] * (orig.0[1] / sum_orig) * 3.0,
+        r.0[2] * (orig.0[2] / sum_orig) * 3.0,
+    ]
+}
+
+// Collects all color-restored values into a flat Vec for percentile computation.
+// The returned vec is not in pixel order (sort destroys order anyway).
+#[cfg(feature = "rayon")]
+fn collect_color_restored_vals(reflectance: &Rgb32FImage, original: &Rgb32FImage) -> Vec<f32> {
+    let (width, height) = reflectance.dimensions();
+    (0..(width * height) as usize)
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            let x = (i as u32) % width;
+            let y = (i as u32) / width;
+            pixel_color_factor(reflectance.get_pixel(x, y), original.get_pixel(x, y))
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "rayon"))]
+fn collect_color_restored_vals(reflectance: &Rgb32FImage, original: &Rgb32FImage) -> Vec<f32> {
+    reflectance
+        .pixels()
+        .zip(original.pixels())
+        .flat_map(|(r, orig)| pixel_color_factor(r, orig))
+        .collect()
+}
+
+fn sort_floats(vals: &mut [f32]) {
+    #[cfg(feature = "rayon")]
+    vals.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    #[cfg(not(feature = "rayon"))]
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+}
+
+// Recomputes color factor per pixel to avoid storing the intermediate raw buffer.
+#[cfg(feature = "rayon")]
+fn write_normalized_pixels(
+    reflectance: &Rgb32FImage,
+    original: &Rgb32FImage,
+    low_val: f32,
+    high_val: f32,
+    refl_range: f32,
+    result: &mut Rgb32FImage,
+) {
+    let (width, height) = result.dimensions();
+    let rows: Vec<_> = (0..height)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = vec![[0.0f32; 3]; width as usize];
+            for x in 0..width {
+                let cf = pixel_color_factor(reflectance.get_pixel(x, y), original.get_pixel(x, y));
+                for (ch, &val) in cf.iter().enumerate() {
+                    row[x as usize][ch] = (val.clamp(low_val, high_val) - low_val) / refl_range;
+                }
+            }
+            (y, row)
+        })
+        .collect();
+    for (y, row_data) in rows {
+        for x in 0..width {
+            result.get_pixel_mut(x, y).0 = row_data[x as usize];
+        }
+    }
+}
+
+#[cfg(not(feature = "rayon"))]
+fn write_normalized_pixels(
+    reflectance: &Rgb32FImage,
+    original: &Rgb32FImage,
+    low_val: f32,
+    high_val: f32,
+    refl_range: f32,
+    result: &mut Rgb32FImage,
+) {
+    let width = result.width();
+    for (i, (r, orig)) in reflectance.pixels().zip(original.pixels()).enumerate() {
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+        let cf = pixel_color_factor(r, orig);
+        for (ch, &val) in cf.iter().enumerate() {
+            result.get_pixel_mut(x, y).0[ch] =
+                (val.clamp(low_val, high_val) - low_val) / refl_range;
+        }
+    }
+}
+
 fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) -> Rgb32FImage {
+    assert_eq!(
+        reflectance.dimensions(),
+        original.dimensions(),
+        "reflectance and original must have equal dimensions"
+    );
     let (width, height) = reflectance.dimensions();
     let mut result = Rgb32FImage::new(width, height);
 
-    let mut all_refl: Vec<f32> = reflectance
-        .pixels()
-        .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
-        .collect();
+    let mut all_vals = collect_color_restored_vals(reflectance, original);
+    sort_floats(&mut all_vals);
 
-    #[cfg(feature = "rayon")]
-    {
-        all_refl.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-    }
-    #[cfg(not(feature = "rayon"))]
-    {
-        all_refl.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    }
-
-    let n = all_refl.len();
+    let n = all_vals.len();
     let low_idx = (n as f32 * 0.02) as usize;
     let high_idx = (n as f32 * 0.98) as usize;
-    let low_val = all_refl[low_idx.min(n - 1)];
-    let high_val = all_refl[high_idx.min(n - 1)];
+    let low_val = all_vals[low_idx.min(n - 1)];
+    let high_val = all_vals[high_idx.min(n - 1)];
     let refl_range = (high_val - low_val).max(EPSILON);
 
-    #[cfg(feature = "rayon")]
-    {
-        let rows: Vec<_> = (0..height)
-            .into_par_iter()
-            .map(|y| {
-                let mut row_result = vec![[0.0f32; 3]; width as usize];
-                for x in 0..width {
-                    let r = reflectance.get_pixel(x, y);
-                    let orig = original.get_pixel(x, y);
-                    let sum_orig: f32 = orig.0.iter().sum::<f32>().max(EPSILON);
-
-                    for (channel, out) in row_result[x as usize].iter_mut().enumerate() {
-                        let clipped = r.0[channel].clamp(low_val, high_val);
-                        let norm_refl = (clipped - low_val) / refl_range;
-                        let color_factor = (orig.0[channel] / sum_orig) * 3.0;
-                        let restored = norm_refl * color_factor;
-                        *out = restored.clamp(0.0, 1.0);
-                    }
-                }
-                (y, row_result)
-            })
-            .collect();
-
-        for (y, row_data) in rows {
-            for x in 0..width {
-                result.get_pixel_mut(x, y).0 = row_data[x as usize];
-            }
-        }
-    }
-
-    #[cfg(not(feature = "rayon"))]
-    {
-        for y in 0..height {
-            for x in 0..width {
-                let r = reflectance.get_pixel(x, y);
-                let orig = original.get_pixel(x, y);
-                let sum_orig: f32 = orig.0.iter().sum::<f32>().max(EPSILON);
-
-                for channel in 0..3 {
-                    let clipped = r.0[channel].clamp(low_val, high_val);
-                    let norm_refl = (clipped - low_val) / refl_range;
-                    let color_factor = (orig.0[channel] / sum_orig) * 3.0;
-                    let restored = norm_refl * color_factor;
-                    result.get_pixel_mut(x, y).0[channel] = restored.clamp(0.0, 1.0);
-                }
-            }
-        }
-    }
+    write_normalized_pixels(
+        reflectance,
+        original,
+        low_val,
+        high_val,
+        refl_range,
+        &mut result,
+    );
 
     result
 }
@@ -958,6 +1005,41 @@ mod tests {
 
         let output = result.unwrap();
         assert_eq!(output.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_apply_color_restoration_order() {
+        // Verify color factor is applied to raw log-domain reflectance BEFORE normalization.
+        // MSRCR: raw[ch] = refl[ch] * (orig[ch] / sum_orig) * 3, then percentile-normalize.
+        let (w, h) = (1, 2);
+        let mut refl = Rgb32FImage::new(w, h);
+        let mut orig_img = Rgb32FImage::new(w, h);
+
+        // Pixel 0: refl=[1.0,0.5,0.3], orig=[0.6,0.3,0.1] → sum=1.0, cf=[1.8,0.9,0.3]
+        // raw = [1.8, 0.45, 0.09]
+        *refl.get_pixel_mut(0, 0) = image::Rgb([1.0f32, 0.5, 0.3]);
+        *orig_img.get_pixel_mut(0, 0) = image::Rgb([0.6f32, 0.3, 0.1]);
+
+        // Pixel 1: refl=[0.2,0.8,0.6], orig=[0.2,0.4,0.4] → sum=1.0, cf=[0.6,1.2,1.2]
+        // raw = [0.12, 0.96, 0.72]
+        *refl.get_pixel_mut(0, 1) = image::Rgb([0.2f32, 0.8, 0.6]);
+        *orig_img.get_pixel_mut(0, 1) = image::Rgb([0.2f32, 0.4, 0.4]);
+
+        let result = apply_color_restoration(&refl, &orig_img);
+
+        // All 6 raw values sorted: [0.09, 0.12, 0.45, 0.72, 0.96, 1.8]
+        // n=6, low_idx=0, high_idx=5 → low=0.09, high=1.8, range=1.71
+        // Pixel 0: [(1.8-0.09)/1.71, (0.45-0.09)/1.71, 0.0] = [1.0, 0.2105, 0.0]
+        // Pixel 1: [(0.12-0.09)/1.71, (0.96-0.09)/1.71, (0.72-0.09)/1.71]
+        //        = [0.01754, 0.50877, 0.36842]
+        let p0 = result.get_pixel(0, 0);
+        let p1 = result.get_pixel(0, 1);
+        assert!((p0.0[0] - 1.0f32).abs() < 1e-4, "p0 ch0 = {}", p0.0[0]);
+        assert!((p0.0[1] - 0.2105f32).abs() < 1e-3, "p0 ch1 = {}", p0.0[1]);
+        assert!((p0.0[2] - 0.0f32).abs() < 1e-4, "p0 ch2 = {}", p0.0[2]);
+        assert!((p1.0[0] - 0.01754f32).abs() < 1e-3, "p1 ch0 = {}", p1.0[0]);
+        assert!((p1.0[1] - 0.50877f32).abs() < 1e-3, "p1 ch1 = {}", p1.0[1]);
+        assert!((p1.0[2] - 0.36842f32).abs() < 1e-3, "p1 ch2 = {}", p1.0[2]);
     }
 
     #[test]
@@ -1063,6 +1145,73 @@ mod tests {
             .fold(f32::NEG_INFINITY, |a, b| a.max(b));
 
         assert!(new_max <= 0.0 || original_max <= 0.0);
+    }
+
+    #[test]
+    fn test_clamp_reflectance_preserves_retinex_identity() {
+        // Retinex identity: intensity = exp(reflectance) * illumination
+        // Shifting log-reflectance by -max_refl requires illumination to scale by exp(max_refl).
+        // Illumination is clamped to [0, 1], so identity only holds where l * exp(max_refl) <= 1.
+        let (w, h) = (4, 4);
+        let mut refl = Rgb32FImage::new(w, h);
+        let mut illum = Rgb32FImage::new(w, h);
+
+        // Use small log-reflectance so exp(max_refl) stays close to 1 and illumination doesn't clip.
+        // max_refl ≈ 0.1 → exp(0.1) ≈ 1.105; with l_max ≈ 0.9, product ≈ 0.995 < 1.
+        for y in 0..h {
+            for x in 0..w {
+                let r = x as f32 * 0.025 + y as f32 * 0.01 - 0.05;
+                let l = 0.1 + (x + y) as f32 * 0.05;
+                *refl.get_pixel_mut(x, y) = image::Rgb([r, r * 0.9, r * 0.95]);
+                *illum.get_pixel_mut(x, y) = image::Rgb([l, l * 0.9, l * 0.95]);
+            }
+        }
+
+        // Snapshot max_refl and illumination before calling so we can detect clipping.
+        let max_refl = refl
+            .pixels()
+            .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+
+        let illum_before: Vec<[f32; 3]> =
+            illum.pixels().map(|p| [p.0[0], p.0[1], p.0[2]]).collect();
+
+        // Snapshot intensity = exp(R) * L before clamping
+        let intensity_before: Vec<[f32; 3]> = refl
+            .pixels()
+            .zip(illum.pixels())
+            .map(|(r, l)| {
+                [
+                    r.0[0].exp() * l.0[0],
+                    r.0[1].exp() * l.0[1],
+                    r.0[2].exp() * l.0[2],
+                ]
+            })
+            .collect();
+
+        clamp_reflectance(&mut refl, &mut illum);
+
+        // For pixels where illumination does not hit the clamp boundary, identity must hold.
+        for (i, (r, l)) in refl.pixels().zip(illum.pixels()).enumerate() {
+            for ch in 0..3 {
+                let would_clip = illum_before[i][ch] * max_refl.exp() > 1.0;
+                if would_clip {
+                    assert!(
+                        (l.0[ch] - 1.0).abs() < 1e-5,
+                        "pixel {i} ch {ch}: clamped pixel should be 1.0, got {}",
+                        l.0[ch]
+                    );
+                } else {
+                    let after = r.0[ch].exp() * l.0[ch];
+                    let expected = intensity_before[i][ch];
+                    let rel_err = (after - expected).abs() / expected.abs().max(1e-6);
+                    assert!(
+                        rel_err < 1e-4,
+                        "pixel {i} ch {ch}: identity broken (before={expected}, after={after})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
