@@ -1,0 +1,218 @@
+version: '3'
+
+vars:
+  # Build profile switching
+  PROFILE: '{{ .PROFILE | default "debug" }}'                # accepts: debug|release
+  PROFILE_FLAG: '{{ if eq .PROFILE "release" }}--release{{ end }}'
+  PROFILE_DIR: '{{ if eq .PROFILE "release" }}release{{ else }}debug{{ end }}'
+
+tasks:
+  default:
+    cmds:
+      - cmd: task --list --sort=none
+        silent: true
+
+  sort:toml:
+    preconditions:
+      - sh: command -v cargo-sort
+        msg: "cargo-sort not found — please install via cargo install cargo-sort"
+    sources:
+      - Cargo.toml
+    cmds:
+      - cargo sort
+
+  fmt:
+    aliases:
+      - format
+    sources:
+      - Cargo.toml
+      - src/**/*.rs
+    cmds:
+      - task: sort:toml
+      - cargo fmt --all
+
+  fmt:check:
+    desc: Check formatting without modifying files
+    cmds:
+      - cargo fmt --all -- --check
+
+  lint:
+    desc: Lint the code
+    cmds:
+      - cargo clippy --all-targets {{.CLI_ARGS}}
+
+  lint:check:
+    desc: Lint with warnings as errors (used by pre-commit)
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+
+  lint-fix:
+    internal: true
+    cmds:
+      - task: lint:fix
+        vars:
+          CLI_ARGS: '{{.CLI_ARGS}}'
+
+  lint:fix:
+    desc: Lint the code and apply fixes
+    aliases:
+      - fix
+    cmds:
+      - cargo clippy --all-targets --fix --allow-staged {{.CLI_ARGS}}
+      - task: fmt
+
+  check:
+    desc: Run all checks — format, lint, and compile
+    cmds:
+      - cargo fmt --all -- --check
+      - cargo clippy --all-targets -- -D warnings
+      - cargo check
+
+  gc:
+    desc: Clean up outdated build artifacts
+    preconditions:
+      - sh: command -v cargo-gc
+        msg: "cargo-gc not found — please install via cargo install cargo-gc-bin"
+    cmds:
+      - cargo gc
+
+  sweep:
+    desc: Clean outdated build artifacts by timestamp (see also gc)
+    preconditions:
+      - sh: command -v cargo-sweep
+        msg: "cargo-sweep not found — please install via cargo install cargo-sweep"
+    cmds:
+      - cargo sweep --installed
+
+  clean:
+    desc: Clean all build artifacts (use sweep for a lightweight clean)
+    status:
+      - test ! -d target
+    cmds:
+      - cargo clean
+
+  build:
+    desc: Build the application
+    sources:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**/*.rs
+    generates:
+      - target/{{.PROFILE_DIR}}/retinex
+    requires:
+      vars:
+        - name: PROFILE
+          enum:
+            - debug
+            - release
+    cmds:
+      - cargo build {{.PROFILE_FLAG}}
+
+  build:timing:
+    desc: Build with timings (nightly)
+    requires:
+      vars:
+        - name: PROFILE
+          enum:
+            - debug
+            - release
+    cmds:
+      - cargo +nightly build --timings=html,json -Zunstable-options {{.PROFILE_FLAG}}
+
+  test:
+    desc: Run all tests
+    env:
+      RUST_LOG: disabled
+    cmds:
+      - cargo test {{.CLI_ARGS}}
+
+  test:docs:
+    desc: Run doctests only
+    env:
+      RUST_LOG: disabled
+    cmds:
+      - cargo test --doc {{.CLI_ARGS}}
+
+  upgrade:deps:
+    desc: Upgrade the dependencies
+    cmds:
+      - cargo upgrade
+      - cargo update
+
+  run:
+    desc: Run retinex with custom arguments
+    cmds:
+      - cargo run {{.PROFILE_FLAG}} -- {{.CLI_ARGS}}
+
+  run:ssr:
+    desc: Single-scale Retinex on house.jpg (grayscale reflectance)
+    cmds:
+      - cargo run --release -- images/house.jpg output.jpg
+
+  run:msr:
+    desc: Multi-scale Retinex on house.jpg (sigmas 15,80,250)
+    cmds:
+      - cargo run --release -- images/house.jpg msr.jpg --mode multi --sigmas 15,80,250
+
+  run:msrcr:
+    desc: Multi-scale Retinex with color restoration on house.jpg (recommended)
+    aliases:
+      - example
+    cmds:
+      - cargo run --release -- images/house.jpg msrcr.jpg --mode multi --sigmas 15,80,250 --color-restore
+
+  run:color:
+    desc: Single-scale Retinex with color restoration on house.jpg
+    cmds:
+      - cargo run --release -- images/house.jpg color.jpg --color-restore
+
+  run:illumination:
+    desc: Save estimated illumination component from house.jpg
+    cmds:
+      - cargo run --release -- images/house.jpg output.jpg --illumination illumination.jpg
+
+  run:reflectance:
+    desc: Save raw reflectance component from house.jpg
+    cmds:
+      - cargo run --release -- images/house.jpg output.jpg --reflectance reflectance.jpg
+
+  run:all:
+    desc: Save all components from house.jpg (MSR + color restore + illumination + reflectance)
+    cmds:
+      - |
+        cargo run --release -- images/house.jpg result.jpg \
+          --mode multi \
+          --sigmas 15,80,250 \
+          --color-restore \
+          --illumination light.jpg \
+          --reflectance refl.jpg
+
+  docs:
+    desc: Build the documentation; use docs:open to also open it
+    sources:
+      - Cargo.toml
+      - src/**/*.rs
+    generates:
+      - target/doc/**
+    cmds:
+      - rm -rf target/doc
+      - cargo doc --document-private-items --no-deps {{.CLI_ARGS}}
+
+  docs:open:
+    desc: Build and open the docs
+    aliases:
+      - open:docs
+    cmds:
+      - task: docs
+        vars:
+          CLI_ARGS: --open {{.CLI_ARGS}}
+
+  crev:verify:
+    desc: Verify the current project against crev
+    cmds:
+      - cargo crev verify {{.CLI_ARGS | default "--show-all"}}
+
+  crev:update:
+    desc: Update crev public proofs
+    cmds:
+      - cargo crev repo fetch all
