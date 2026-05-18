@@ -640,7 +640,7 @@ pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32
                         let r = refl_pixel.0[channel];
                         let l = illum_pixel.0[channel];
                         refl_pixel.0[channel] = r - max_refl;
-                        illum_pixel.0[channel] = (l + max_refl).clamp(0.0, 1.0);
+                        illum_pixel.0[channel] = (l * max_refl.exp()).clamp(0.0, 1.0);
                     }
                 });
         }
@@ -655,7 +655,7 @@ pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32
                         let l = illumination.get_pixel(x, y).0[channel];
                         reflectance.get_pixel_mut(x, y).0[channel] = r - max_refl;
                         illumination.get_pixel_mut(x, y).0[channel] =
-                            (l + max_refl).clamp(0.0, 1.0);
+                            (l * max_refl.exp()).clamp(0.0, 1.0);
                     }
                 }
             }
@@ -1063,6 +1063,73 @@ mod tests {
             .fold(f32::NEG_INFINITY, |a, b| a.max(b));
 
         assert!(new_max <= 0.0 || original_max <= 0.0);
+    }
+
+    #[test]
+    fn test_clamp_reflectance_preserves_retinex_identity() {
+        // Retinex identity: intensity = exp(reflectance) * illumination
+        // Shifting log-reflectance by -max_refl requires illumination to scale by exp(max_refl).
+        // Illumination is clamped to [0, 1], so identity only holds where l * exp(max_refl) <= 1.
+        let (w, h) = (4, 4);
+        let mut refl = Rgb32FImage::new(w, h);
+        let mut illum = Rgb32FImage::new(w, h);
+
+        // Use small log-reflectance so exp(max_refl) stays close to 1 and illumination doesn't clip.
+        // max_refl ≈ 0.1 → exp(0.1) ≈ 1.105; with l_max ≈ 0.9, product ≈ 0.995 < 1.
+        for y in 0..h {
+            for x in 0..w {
+                let r = x as f32 * 0.025 + y as f32 * 0.01 - 0.05;
+                let l = 0.1 + (x + y) as f32 * 0.05;
+                *refl.get_pixel_mut(x, y) = image::Rgb([r, r * 0.9, r * 0.95]);
+                *illum.get_pixel_mut(x, y) = image::Rgb([l, l * 0.9, l * 0.95]);
+            }
+        }
+
+        // Snapshot max_refl and illumination before calling so we can detect clipping.
+        let max_refl = refl
+            .pixels()
+            .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+
+        let illum_before: Vec<[f32; 3]> =
+            illum.pixels().map(|p| [p.0[0], p.0[1], p.0[2]]).collect();
+
+        // Snapshot intensity = exp(R) * L before clamping
+        let intensity_before: Vec<[f32; 3]> = refl
+            .pixels()
+            .zip(illum.pixels())
+            .map(|(r, l)| {
+                [
+                    r.0[0].exp() * l.0[0],
+                    r.0[1].exp() * l.0[1],
+                    r.0[2].exp() * l.0[2],
+                ]
+            })
+            .collect();
+
+        clamp_reflectance(&mut refl, &mut illum);
+
+        // For pixels where illumination does not hit the clamp boundary, identity must hold.
+        for (i, (r, l)) in refl.pixels().zip(illum.pixels()).enumerate() {
+            for ch in 0..3 {
+                let would_clip = illum_before[i][ch] * max_refl.exp() > 1.0;
+                if would_clip {
+                    assert!(
+                        (l.0[ch] - 1.0).abs() < 1e-5,
+                        "pixel {i} ch {ch}: clamped pixel should be 1.0, got {}",
+                        l.0[ch]
+                    );
+                } else {
+                    let after = r.0[ch].exp() * l.0[ch];
+                    let expected = intensity_before[i][ch];
+                    let rel_err = (after - expected).abs() / expected.abs().max(1e-6);
+                    assert!(
+                        rel_err < 1e-4,
+                        "pixel {i} ch {ch}: identity broken (before={expected}, after={after})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
