@@ -19,11 +19,12 @@ struct Cli {
     #[arg(short, long, value_enum, default_value = "single")]
     mode: Mode,
 
+    /// Comma-separated Gaussian blur radii, e.g. `15,80,250` for multi-scale (must be positive)
     #[arg(long, value_delimiter = ',')]
     sigmas: Option<Vec<f32>>,
 
-    /// Auto-select sigma values based on image dimensions (mutually exclusive with --sigmas)
-    #[arg(long, default_value_t = false)]
+    /// Auto-select sigma values from image dimensions; produces 1 sigma for single mode, 3 for multi
+    #[arg(long)]
     auto_sigmas: bool,
 
     /// Save the estimated illumination to a separate file
@@ -69,10 +70,6 @@ fn main() {
         println!("Auto-selected sigmas: {selected:?}");
         selected
     } else if let Some(provided) = cli.sigmas {
-        if provided.is_empty() {
-            eprintln!("Sigmas cannot be empty");
-            std::process::exit(1);
-        }
         if let Some(&invalid) = provided.iter().find(|&&sigma| sigma <= 0.0) {
             eprintln!("Sigmas must be positive, got {invalid}");
             std::process::exit(1);
@@ -84,6 +81,7 @@ fn main() {
 
     // Save illumination if requested
     if let Some(illum_path) = &cli.illumination {
+        // Use the finest (first) sigma for illumination visualization
         let illum_result = extract_illumination(&image, sigmas[0]);
 
         match illum_result {
