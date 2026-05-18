@@ -424,10 +424,10 @@ pub fn normalize_reflectance(image: &Rgb32FImage) -> RgbImage {
                 let mut row_pixels = vec![[0u8; 3]; width as usize];
                 for x in 0..width {
                     let source = image.get_pixel(x, y);
-                    for channel in 0..3 {
+                    for (channel, out) in row_pixels[x as usize].iter_mut().enumerate() {
                         let clipped = source.0[channel].clamp(low_val, high_val);
                         let scaled = (clipped - low_val) / range;
-                        row_pixels[x as usize][channel] = (scaled * 255.0 + 0.5) as u8;
+                        *out = (scaled * 255.0 + 0.5) as u8;
                     }
                 }
                 (y, row_pixels)
@@ -647,6 +647,7 @@ pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32
 
         #[cfg(not(feature = "rayon"))]
         {
+            let (width, height) = reflectance.dimensions();
             for y in 0..height {
                 for x in 0..width {
                     for channel in 0..3 {
@@ -847,12 +848,12 @@ fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) ->
                     let orig = original.get_pixel(x, y);
                     let sum_orig: f32 = orig.0.iter().sum::<f32>().max(EPSILON);
 
-                    for channel in 0..3 {
+                    for (channel, out) in row_result[x as usize].iter_mut().enumerate() {
                         let clipped = r.0[channel].clamp(low_val, high_val);
                         let norm_refl = (clipped - low_val) / refl_range;
                         let color_factor = (orig.0[channel] / sum_orig) * 3.0;
                         let restored = norm_refl * color_factor;
-                        row_result[x as usize][channel] = restored.clamp(0.0, 1.0);
+                        *out = restored.clamp(0.0, 1.0);
                     }
                 }
                 (y, row_result)
