@@ -60,13 +60,15 @@
 //! - Reflectance is in log-domain (can be negative)
 //! - Output is converted to 8-bit RGB [0, 255] only at export time
 
-use image::{DynamicImage, ImageBuffer, Luma, Rgb, Rgb32FImage, RgbImage};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Luma, Rgb, Rgb32FImage, RgbImage};
 use imageproc::filter::gaussian_blur_f32;
 
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
 const EPSILON: f32 = 1e-6;
+const SIGMA_RATIOS: [f32; 3] = [0.030, 0.160, 0.500];
+const SIGMA_MIN: f32 = 2.0;
 
 /// Errors that can occur during Retinex processing
 #[derive(Debug)]
@@ -664,6 +666,44 @@ pub fn clamp_reflectance(reflectance: &mut Rgb32FImage, illumination: &mut Rgb32
     }
 }
 
+/// Suggest sigma values for multi-scale Retinex based on image dimensions.
+///
+/// Returns three sigma values `[fine, medium, coarse]` scaled proportionally
+/// to `min(width, height)`. Derived from the classic MSR defaults `[15, 80, 250]`
+/// calibrated for ~500 px images. Each value is clamped to at least `2.0`.
+///
+/// Pass the result directly to [`multi_scale_retinex`] or related functions:
+///
+/// ```rust,no_run
+/// use retinex::{suggest_sigmas, multi_scale_retinex_color_restored};
+/// let image = image::open("images/house.jpg").unwrap();
+/// let sigmas = suggest_sigmas(&image);
+/// let result = multi_scale_retinex_color_restored(&image, &sigmas).unwrap();
+/// ```
+pub fn suggest_sigmas(image: &DynamicImage) -> [f32; 3] {
+    let (width, height) = image.dimensions();
+    suggest_sigmas_for_dimensions(width, height)
+}
+
+/// Suggest a sigma value for single-scale Retinex based on image dimensions.
+///
+/// Returns the medium-scale sigma from [`suggest_sigmas`] (index 1), suitable
+/// for [`single_scale_retinex`] and related functions.
+///
+/// ```rust,no_run
+/// use retinex::{suggest_sigma, single_scale_retinex};
+/// let image = image::open("images/house.jpg").unwrap();
+/// let result = single_scale_retinex(&image, suggest_sigma(&image)).unwrap();
+/// ```
+pub fn suggest_sigma(image: &DynamicImage) -> f32 {
+    suggest_sigmas(image)[1]
+}
+
+fn suggest_sigmas_for_dimensions(width: u32, height: u32) -> [f32; 3] {
+    let min_dim = width.min(height) as f32;
+    SIGMA_RATIOS.map(|ratio| (ratio * min_dim).max(SIGMA_MIN))
+}
+
 // Internal helper functions
 
 fn ssr_rgb32f_with_illumination(image: &Rgb32FImage, sigma: f32) -> (Rgb32FImage, Rgb32FImage) {
@@ -1227,6 +1267,55 @@ mod tests {
                     "Illumination value {} out of range [0, 1]",
                     pixel.0[channel]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_suggest_sigmas_known_dimensions() {
+        let sigmas = suggest_sigmas_for_dimensions(500, 400);
+        assert_eq!(sigmas, [12.0, 64.0, 200.0]);
+    }
+
+    #[test]
+    fn test_suggest_sigmas_small_image() {
+        let sigmas = suggest_sigmas_for_dimensions(10, 10);
+        assert_eq!(sigmas, [2.0, 2.0, 5.0]);
+    }
+
+    #[test]
+    fn test_suggest_sigmas_ordered() {
+        for &(w, h) in &[(100u32, 100u32), (200, 100), (50, 800), (1920, 1080)] {
+            let sigmas = suggest_sigmas_for_dimensions(w, h);
+            assert!(
+                sigmas[0] <= sigmas[1],
+                "fine <= medium failed for {}x{}: {:?}",
+                w,
+                h,
+                sigmas
+            );
+            assert!(
+                sigmas[1] <= sigmas[2],
+                "medium <= coarse failed for {}x{}: {:?}",
+                w,
+                h,
+                sigmas
+            );
+        }
+    }
+
+    #[test]
+    fn test_suggest_sigma_returns_middle_scale() {
+        let image = DynamicImage::new_rgb8(500, 400);
+        assert_eq!(suggest_sigma(&image), suggest_sigmas(&image)[1]);
+    }
+
+    #[test]
+    fn test_suggest_sigmas_all_positive() {
+        for &(w, h) in &[(1u32, 1u32), (10, 10), (100, 100), (4000, 3000)] {
+            let sigmas = suggest_sigmas_for_dimensions(w, h);
+            for &s in &sigmas {
+                assert!(s > 0.0, "sigma must be positive for {}x{}, got {}", w, h, s);
             }
         }
     }
