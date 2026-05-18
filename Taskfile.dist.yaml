@@ -187,6 +187,18 @@ tasks:
           --illumination light.jpg \
           --reflectance refl.jpg
 
+  readme:gen:
+    desc: Regenerate all readme/ example images (run after algorithm changes)
+    vars:
+      SCRATCH: /tmp/retinex_scratch.jpg
+    cmds:
+      - cargo build --release
+      - cargo run --release -- images/house.jpg readme/house_basic.jpg --mode single --sigmas 15
+      - cargo run --release -- images/house.jpg readme/house_msr.jpg --mode multi --sigmas 15,80,250 --color-restore
+      - cargo run --release -- images/house.jpg {{.SCRATCH}} --illumination readme/house_illumination.jpg
+      - cargo run --release -- images/house.jpg {{.SCRATCH}} --reflectance readme/house_reflectance.jpg
+      - rm -f {{.SCRATCH}}
+
   docs:
     desc: Build the documentation; use docs:open to also open it
     sources:
