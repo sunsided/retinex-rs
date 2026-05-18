@@ -816,73 +816,46 @@ fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) ->
     let (width, height) = reflectance.dimensions();
     let mut result = Rgb32FImage::new(width, height);
 
-    let mut all_refl: Vec<f32> = reflectance
+    // Pass 1: apply color factor to raw log-domain reflectance per pixel
+    let raw: Vec<[f32; 3]> = reflectance
         .pixels()
-        .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
+        .zip(original.pixels())
+        .map(|(r, orig)| {
+            let sum_orig = orig.0.iter().sum::<f32>().max(EPSILON);
+            [
+                r.0[0] * (orig.0[0] / sum_orig) * 3.0,
+                r.0[1] * (orig.0[1] / sum_orig) * 3.0,
+                r.0[2] * (orig.0[2] / sum_orig) * 3.0,
+            ]
+        })
         .collect();
 
+    // Compute percentile clip bounds on the color-restored values
+    let mut all_vals: Vec<f32> = raw.iter().flat_map(|p| *p).collect();
+
     #[cfg(feature = "rayon")]
     {
-        all_refl.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        all_vals.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
     }
     #[cfg(not(feature = "rayon"))]
     {
-        all_refl.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        all_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
     }
 
-    let n = all_refl.len();
+    let n = all_vals.len();
     let low_idx = (n as f32 * 0.02) as usize;
     let high_idx = (n as f32 * 0.98) as usize;
-    let low_val = all_refl[low_idx.min(n - 1)];
-    let high_val = all_refl[high_idx.min(n - 1)];
+    let low_val = all_vals[low_idx.min(n - 1)];
+    let high_val = all_vals[high_idx.min(n - 1)];
     let refl_range = (high_val - low_val).max(EPSILON);
 
-    #[cfg(feature = "rayon")]
-    {
-        let rows: Vec<_> = (0..height)
-            .into_par_iter()
-            .map(|y| {
-                let mut row_result = vec![[0.0f32; 3]; width as usize];
-                for x in 0..width {
-                    let r = reflectance.get_pixel(x, y);
-                    let orig = original.get_pixel(x, y);
-                    let sum_orig: f32 = orig.0.iter().sum::<f32>().max(EPSILON);
-
-                    for (channel, out) in row_result[x as usize].iter_mut().enumerate() {
-                        let clipped = r.0[channel].clamp(low_val, high_val);
-                        let norm_refl = (clipped - low_val) / refl_range;
-                        let color_factor = (orig.0[channel] / sum_orig) * 3.0;
-                        let restored = norm_refl * color_factor;
-                        *out = restored.clamp(0.0, 1.0);
-                    }
-                }
-                (y, row_result)
-            })
-            .collect();
-
-        for (y, row_data) in rows {
-            for x in 0..width {
-                result.get_pixel_mut(x, y).0 = row_data[x as usize];
-            }
-        }
-    }
-
-    #[cfg(not(feature = "rayon"))]
-    {
-        for y in 0..height {
-            for x in 0..width {
-                let r = reflectance.get_pixel(x, y);
-                let orig = original.get_pixel(x, y);
-                let sum_orig: f32 = orig.0.iter().sum::<f32>().max(EPSILON);
-
-                for channel in 0..3 {
-                    let clipped = r.0[channel].clamp(low_val, high_val);
-                    let norm_refl = (clipped - low_val) / refl_range;
-                    let color_factor = (orig.0[channel] / sum_orig) * 3.0;
-                    let restored = norm_refl * color_factor;
-                    result.get_pixel_mut(x, y).0[channel] = restored.clamp(0.0, 1.0);
-                }
-            }
+    // Pass 2: normalize using combined percentile bounds and write output
+    for (i, pixel_vals) in raw.iter().enumerate() {
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+        for (ch, &val) in pixel_vals.iter().enumerate() {
+            let norm = (val.clamp(low_val, high_val) - low_val) / refl_range;
+            result.get_pixel_mut(x, y).0[ch] = norm;
         }
     }
 
@@ -958,6 +931,41 @@ mod tests {
 
         let output = result.unwrap();
         assert_eq!(output.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_apply_color_restoration_order() {
+        // Verify color factor is applied to raw log-domain reflectance BEFORE normalization.
+        // MSRCR: raw[ch] = refl[ch] * (orig[ch] / sum_orig) * 3, then percentile-normalize.
+        let (w, h) = (1, 2);
+        let mut refl = Rgb32FImage::new(w, h);
+        let mut orig_img = Rgb32FImage::new(w, h);
+
+        // Pixel 0: refl=[1.0,0.5,0.3], orig=[0.6,0.3,0.1] → sum=1.0, cf=[1.8,0.9,0.3]
+        // raw = [1.8, 0.45, 0.09]
+        *refl.get_pixel_mut(0, 0) = image::Rgb([1.0f32, 0.5, 0.3]);
+        *orig_img.get_pixel_mut(0, 0) = image::Rgb([0.6f32, 0.3, 0.1]);
+
+        // Pixel 1: refl=[0.2,0.8,0.6], orig=[0.2,0.4,0.4] → sum=1.0, cf=[0.6,1.2,1.2]
+        // raw = [0.12, 0.96, 0.72]
+        *refl.get_pixel_mut(0, 1) = image::Rgb([0.2f32, 0.8, 0.6]);
+        *orig_img.get_pixel_mut(0, 1) = image::Rgb([0.2f32, 0.4, 0.4]);
+
+        let result = apply_color_restoration(&refl, &orig_img);
+
+        // All 6 raw values sorted: [0.09, 0.12, 0.45, 0.72, 0.96, 1.8]
+        // n=6, low_idx=0, high_idx=5 → low=0.09, high=1.8, range=1.71
+        // Pixel 0: [(1.8-0.09)/1.71, (0.45-0.09)/1.71, 0.0] = [1.0, 0.2105, 0.0]
+        // Pixel 1: [(0.12-0.09)/1.71, (0.96-0.09)/1.71, (0.72-0.09)/1.71]
+        //        = [0.01754, 0.50877, 0.36842]
+        let p0 = result.get_pixel(0, 0);
+        let p1 = result.get_pixel(0, 1);
+        assert!((p0.0[0] - 1.0f32).abs() < 1e-4, "p0 ch0 = {}", p0.0[0]);
+        assert!((p0.0[1] - 0.2105f32).abs() < 1e-3, "p0 ch1 = {}", p0.0[1]);
+        assert!((p0.0[2] - 0.0f32).abs() < 1e-4, "p0 ch2 = {}", p0.0[2]);
+        assert!((p1.0[0] - 0.01754f32).abs() < 1e-3, "p1 ch0 = {}", p1.0[0]);
+        assert!((p1.0[1] - 0.50877f32).abs() < 1e-3, "p1 ch1 = {}", p1.0[1]);
+        assert!((p1.0[2] - 0.36842f32).abs() < 1e-3, "p1 ch2 = {}", p1.0[2]);
     }
 
     #[test]
