@@ -812,33 +812,29 @@ fn msr_rgb32f_with_illumination(image: &Rgb32FImage, sigmas: &[f32]) -> (Rgb32FI
     }
 }
 
-fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) -> Rgb32FImage {
+#[cfg(feature = "rayon")]
+fn compute_color_factor_raw(reflectance: &Rgb32FImage, original: &Rgb32FImage) -> Vec<[f32; 3]> {
     let (width, height) = reflectance.dimensions();
-    let mut result = Rgb32FImage::new(width, height);
+    (0..(width * height) as usize)
+        .into_par_iter()
+        .map(|i| {
+            let x = (i as u32) % width;
+            let y = (i as u32) / width;
+            let r = reflectance.get_pixel(x, y);
+            let orig = original.get_pixel(x, y);
+            let sum_orig = orig.0.iter().sum::<f32>().max(EPSILON);
+            [
+                r.0[0] * (orig.0[0] / sum_orig) * 3.0,
+                r.0[1] * (orig.0[1] / sum_orig) * 3.0,
+                r.0[2] * (orig.0[2] / sum_orig) * 3.0,
+            ]
+        })
+        .collect()
+}
 
-    // Pass 1: apply color factor to raw log-domain reflectance per pixel
-    #[cfg(feature = "rayon")]
-    let raw: Vec<[f32; 3]> = {
-        let n_pixels = (width * height) as usize;
-        (0..n_pixels)
-            .into_par_iter()
-            .map(|i| {
-                let x = (i as u32) % width;
-                let y = (i as u32) / width;
-                let r = reflectance.get_pixel(x, y);
-                let orig = original.get_pixel(x, y);
-                let sum_orig = orig.0.iter().sum::<f32>().max(EPSILON);
-                [
-                    r.0[0] * (orig.0[0] / sum_orig) * 3.0,
-                    r.0[1] * (orig.0[1] / sum_orig) * 3.0,
-                    r.0[2] * (orig.0[2] / sum_orig) * 3.0,
-                ]
-            })
-            .collect()
-    };
-
-    #[cfg(not(feature = "rayon"))]
-    let raw: Vec<[f32; 3]> = reflectance
+#[cfg(not(feature = "rayon"))]
+fn compute_color_factor_raw(reflectance: &Rgb32FImage, original: &Rgb32FImage) -> Vec<[f32; 3]> {
+    reflectance
         .pixels()
         .zip(original.pixels())
         .map(|(r, orig)| {
@@ -849,19 +845,72 @@ fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) ->
                 r.0[2] * (orig.0[2] / sum_orig) * 3.0,
             ]
         })
-        .collect();
+        .collect()
+}
 
-    // Compute percentile clip bounds on the color-restored values
-    let mut all_vals: Vec<f32> = raw.iter().flat_map(|p| *p).collect();
-
+fn sort_floats(vals: &mut [f32]) {
     #[cfg(feature = "rayon")]
-    {
-        all_vals.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-    }
+    vals.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
     #[cfg(not(feature = "rayon"))]
-    {
-        all_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+}
+
+#[cfg(feature = "rayon")]
+fn write_normalized_pixels(
+    raw: &[[f32; 3]],
+    low_val: f32,
+    high_val: f32,
+    refl_range: f32,
+    result: &mut Rgb32FImage,
+) {
+    let (width, height) = result.dimensions();
+    let rows: Vec<_> = (0..height)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = vec![[0.0f32; 3]; width as usize];
+            for x in 0..width {
+                let i = (y * width + x) as usize;
+                for (ch, &val) in raw[i].iter().enumerate() {
+                    row[x as usize][ch] = (val.clamp(low_val, high_val) - low_val) / refl_range;
+                }
+            }
+            (y, row)
+        })
+        .collect();
+    for (y, row_data) in rows {
+        for x in 0..width {
+            result.get_pixel_mut(x, y).0 = row_data[x as usize];
+        }
     }
+}
+
+#[cfg(not(feature = "rayon"))]
+fn write_normalized_pixels(
+    raw: &[[f32; 3]],
+    low_val: f32,
+    high_val: f32,
+    refl_range: f32,
+    result: &mut Rgb32FImage,
+) {
+    let width = result.width();
+    for (i, pixel_vals) in raw.iter().enumerate() {
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+        for (ch, &val) in pixel_vals.iter().enumerate() {
+            result.get_pixel_mut(x, y).0[ch] =
+                (val.clamp(low_val, high_val) - low_val) / refl_range;
+        }
+    }
+}
+
+fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) -> Rgb32FImage {
+    let (width, height) = reflectance.dimensions();
+    let mut result = Rgb32FImage::new(width, height);
+
+    let raw = compute_color_factor_raw(reflectance, original);
+
+    let mut all_vals: Vec<f32> = raw.iter().flat_map(|p| *p).collect();
+    sort_floats(&mut all_vals);
 
     let n = all_vals.len();
     let low_idx = (n as f32 * 0.02) as usize;
@@ -870,38 +919,7 @@ fn apply_color_restoration(reflectance: &Rgb32FImage, original: &Rgb32FImage) ->
     let high_val = all_vals[high_idx.min(n - 1)];
     let refl_range = (high_val - low_val).max(EPSILON);
 
-    // Pass 2: normalize using combined percentile bounds and write output
-    #[cfg(feature = "rayon")]
-    {
-        let rows: Vec<_> = (0..height)
-            .into_par_iter()
-            .map(|y| {
-                let mut row = vec![[0.0f32; 3]; width as usize];
-                for x in 0..width {
-                    let i = (y * width + x) as usize;
-                    for (ch, &val) in raw[i].iter().enumerate() {
-                        row[x as usize][ch] = (val.clamp(low_val, high_val) - low_val) / refl_range;
-                    }
-                }
-                (y, row)
-            })
-            .collect();
-        for (y, row_data) in rows {
-            for x in 0..width {
-                result.get_pixel_mut(x, y).0 = row_data[x as usize];
-            }
-        }
-    }
-
-    #[cfg(not(feature = "rayon"))]
-    for (i, pixel_vals) in raw.iter().enumerate() {
-        let x = (i as u32) % width;
-        let y = (i as u32) / width;
-        for (ch, &val) in pixel_vals.iter().enumerate() {
-            let norm = (val.clamp(low_val, high_val) - low_val) / refl_range;
-            result.get_pixel_mut(x, y).0[ch] = norm;
-        }
-    }
+    write_normalized_pixels(&raw, low_val, high_val, refl_range, &mut result);
 
     result
 }
