@@ -126,6 +126,13 @@ tasks:
     cmds:
       - cargo test {{.CLI_ARGS}}
 
+  test:gradient:
+    desc: Run tests for the gradient intrinsic decomposition feature
+    env:
+      RUST_LOG: disabled
+    cmds:
+      - cargo test --features gradient {{.CLI_ARGS}}
+
   test:docs:
     desc: Run doctests only
     env:
@@ -165,6 +172,16 @@ tasks:
     desc: Single-scale Retinex with color restoration on house.jpg
     cmds:
       - cargo run --release -- images/house.jpg color.jpg --color-restore
+
+  run:gradient:
+    desc: Gradient intrinsic decomposition on house.jpg (reflectance output)
+    cmds:
+      - cargo run --release --features gradient -- images/house.jpg gradient.jpg --mode gradient
+
+  run:gradient:all:
+    desc: Gradient intrinsic decomposition on house.jpg (reflectance + shading)
+    cmds:
+      - cargo run --release --features gradient -- images/house.jpg gradient.jpg --mode gradient --illumination gradient_shading.jpg
 
   run:illumination:
     desc: Save estimated illumination component from house.jpg
