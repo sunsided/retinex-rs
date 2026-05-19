@@ -52,9 +52,9 @@ fn solve_log_reflectance(
     n: usize,
     lambda: f64,
 ) -> RetinexResult<Vec<f64>> {
-    // Build A'A + λI directly as triplets (lower triangular only, as required by sprs-ldl).
+    // Build A'A + λI directly as triplets (full symmetric matrix; sprs-ldl checks symmetry).
     // For each constraint row with A[row,p]=-1, A[row,q]=+1 (q > p always):
-    //   A'A[p,p] += 1,  A'A[q,q] += 1,  A'A[q,p] += -1  (lower triangle: row q > col p)
+    //   A'A[p,p] += 1,  A'A[q,q] += 1,  A'A[q,p] = A'A[p,q] = -1
     //   A'b[p] -= rhs,  A'b[q] += rhs
     let mut ata: TriMat<f64> = TriMat::new((n, n));
     let mut atb = vec![0.0f64; n];
