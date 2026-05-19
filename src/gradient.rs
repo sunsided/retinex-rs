@@ -89,11 +89,69 @@ fn solve_log_reflectance(
     Ok(ldl.solve(&atb))
 }
 
+fn enforce_physical_constraint(log_refl: &mut [f64]) {
+    let max_val = log_refl.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if max_val > 0.0 {
+        for v in log_refl.iter_mut() {
+            *v -= max_val;
+        }
+    }
+}
+
+fn reconstruct_color(
+    log_refl: &[f64],
+    original: &Rgb32FImage,
+    width: u32,
+    height: u32,
+) -> (Rgb32FImage, Rgb32FImage) {
+    let mut reflectance = Rgb32FImage::new(width, height);
+    let mut shading = Rgb32FImage::new(width, height);
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = (y * width + x) as usize;
+            let orig = original.get_pixel(x, y);
+
+            let luma = 0.2126 * orig.0[0] + 0.7152 * orig.0[1] + 0.0722 * orig.0[2];
+            let refl_luma = (log_refl[idx] as f32).exp();
+            let ratio = refl_luma / (luma + EPSILON);
+
+            for ch in 0..3 {
+                let r = (orig.0[ch] * ratio).clamp(0.0, 1.0);
+                let s = (orig.0[ch] / (r + EPSILON)).clamp(0.0, 1.0);
+                reflectance.get_pixel_mut(x, y).0[ch] = r;
+                shading.get_pixel_mut(x, y).0[ch] = s;
+            }
+        }
+    }
+
+    (reflectance, shading)
+}
+
 pub fn gradient_intrinsic_decomp(
-    _image: &DynamicImage,
-    _threshold: Option<f32>,
+    image: &DynamicImage,
+    threshold: Option<f32>,
 ) -> RetinexResult<IntrinsicOutput> {
-    todo!()
+    let threshold = threshold.unwrap_or(DEFAULT_THRESHOLD);
+    if threshold <= 0.0 {
+        return Err(RetinexError::InvalidThreshold(threshold));
+    }
+
+    let rgb = image.to_rgb32f();
+    let (width, height) = rgb.dimensions();
+    let n = (width * height) as usize;
+
+    let log_luma = to_log_luma(&rgb);
+    let constraints = classify_gradients(&log_luma, width, height, threshold);
+    let mut log_refl = solve_log_reflectance(&constraints, n, 1e-6)?;
+    enforce_physical_constraint(&mut log_refl);
+
+    let (reflectance, shading) = reconstruct_color(&log_refl, &rgb, width, height);
+
+    Ok(IntrinsicOutput {
+        reflectance,
+        shading,
+    })
 }
 
 fn to_log_luma(image: &Rgb32FImage) -> Vec<f32> {
@@ -109,7 +167,7 @@ fn to_log_luma(image: &Rgb32FImage) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{Rgb, Rgb32FImage};
+    use image::{GenericImageView, Rgb, Rgb32FImage};
 
     #[test]
     fn test_log_luma_red_pixel() {
@@ -211,5 +269,72 @@ mod tests {
         let solution = solve_log_reflectance(&constraints, 2, 1e-6).expect("solver should succeed");
         let diff = (solution[1] - solution[0]).abs();
         assert!(diff < 1e-3, "reflectance should be smooth, diff = {diff}");
+    }
+
+    fn load_test_image() -> image::DynamicImage {
+        image::open("images/house.jpg").expect("Failed to load test image")
+    }
+
+    #[test]
+    fn test_gradient_decomp_basic() {
+        let img = load_test_image();
+        let result = gradient_intrinsic_decomp(&img, None);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let out = result.unwrap();
+        assert_eq!(out.reflectance.dimensions(), img.dimensions());
+        assert_eq!(out.shading.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn test_gradient_decomp_physical_constraint() {
+        let img = load_test_image();
+        let out = gradient_intrinsic_decomp(&img, None).unwrap();
+        for pixel in out.reflectance.pixels() {
+            for ch in 0..3 {
+                assert!(
+                    pixel.0[ch] <= 1.0 + 1e-5,
+                    "reflectance channel {} = {} exceeds 1.0",
+                    ch,
+                    pixel.0[ch]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_gradient_decomp_invalid_threshold() {
+        let img = load_test_image();
+        let result = gradient_intrinsic_decomp(&img, Some(-0.1));
+        assert!(matches!(result, Err(RetinexError::InvalidThreshold(_))));
+    }
+
+    #[test]
+    fn test_gradient_decomp_zero_threshold() {
+        let img = load_test_image();
+        let result = gradient_intrinsic_decomp(&img, Some(0.0));
+        assert!(matches!(result, Err(RetinexError::InvalidThreshold(_))));
+    }
+
+    #[test]
+    fn test_gradient_decomp_synthetic_step_edge() {
+        // 4x4 image with hard luminance step at x=2.
+        // Left two columns: ~0.2 (v=51), right two columns: ~0.8 (v=204).
+        // After decomp, reflectance should differ significantly across the edge.
+        let mut img = image::RgbImage::new(4, 4);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let v: u8 = if x < 2 { 51 } else { 204 };
+                img.put_pixel(x, y, image::Rgb([v, v, v]));
+            }
+        }
+        let dyn_img = image::DynamicImage::ImageRgb8(img);
+        let out = gradient_intrinsic_decomp(&dyn_img, Some(0.05)).unwrap();
+
+        let r_left = out.reflectance.get_pixel(1, 2).0[0];
+        let r_right = out.reflectance.get_pixel(2, 2).0[0];
+        assert!(
+            (r_right - r_left).abs() > 0.1,
+            "expected reflectance edge at x=1/2, got left={r_left:.3}, right={r_right:.3}"
+        );
     }
 }
