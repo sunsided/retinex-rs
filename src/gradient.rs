@@ -1,4 +1,6 @@
 use image::{DynamicImage, Rgb32FImage};
+use sprs::TriMat;
+use sprs_ldl::Ldl;
 
 use crate::{EPSILON, IntrinsicOutput, RetinexError, RetinexResult};
 
@@ -43,6 +45,48 @@ fn classify_gradients(
     }
 
     constraints
+}
+
+fn solve_log_reflectance(
+    constraints: &[Constraint],
+    n: usize,
+    lambda: f64,
+) -> RetinexResult<Vec<f64>> {
+    // Build A'A + λI directly as triplets (lower triangular only, as required by sprs-ldl).
+    // For each constraint row with A[row,p]=-1, A[row,q]=+1 (q > p always):
+    //   A'A[p,p] += 1,  A'A[q,q] += 1,  A'A[q,p] += -1  (lower triangle: row q > col p)
+    //   A'b[p] -= rhs,  A'b[q] += rhs
+    let mut ata: TriMat<f64> = TriMat::new((n, n));
+    let mut atb = vec![0.0f64; n];
+
+    // Tikhonov regularization: add λ to every diagonal entry
+    for i in 0..n {
+        ata.add_triplet(i, i, lambda);
+    }
+
+    for c in constraints {
+        let p = c.p;
+        let q = c.q; // q > p always (by construction in classify_gradients)
+        let rhs = c.rhs as f64;
+
+        ata.add_triplet(p, p, 1.0); // A'A[p,p] += 1
+        ata.add_triplet(q, q, 1.0); // A'A[q,q] += 1
+        // Off-diagonal entries (both triangles so the matrix is fully symmetric)
+        ata.add_triplet(q, p, -1.0); // lower triangle: row q > col p
+        ata.add_triplet(p, q, -1.0); // upper triangle: row p < col q
+
+        atb[p] -= rhs;
+        atb[q] += rhs;
+    }
+
+    // TriMat::to_csc() sums duplicate entries automatically (correct for accumulation above).
+    let ata_csc = ata.to_csc::<usize>();
+
+    let ldl = Ldl::new()
+        .numeric(ata_csc.view())
+        .map_err(|_| RetinexError::SolverFailed("LDL factorization failed".into()))?;
+
+    Ok(ldl.solve(&atb))
 }
 
 pub fn gradient_intrinsic_decomp(
@@ -141,5 +185,31 @@ mod tests {
         assert_eq!(constraints[0].q, 1);
         assert_eq!(constraints[1].p, 1);
         assert_eq!(constraints[1].q, 2);
+    }
+
+    #[test]
+    fn test_solver_follows_reflectance_edge() {
+        // 2 pixels, large gradient → reflectance edge
+        // Solution diff should ≈ log(0.8) - log(0.3)
+        let log_luma = vec![(0.3f32 + 1e-6).ln(), (0.8f32 + 1e-6).ln()];
+        let constraints = classify_gradients(&log_luma, 2, 1, 0.05);
+        let solution = solve_log_reflectance(&constraints, 2, 1e-6).expect("solver should succeed");
+        assert_eq!(solution.len(), 2);
+        let diff = solution[1] - solution[0];
+        let expected = (log_luma[1] - log_luma[0]) as f64;
+        assert!(
+            (diff - expected).abs() < 1e-3,
+            "expected diff ≈ {expected:.4}, got {diff:.4}"
+        );
+    }
+
+    #[test]
+    fn test_solver_smooth_for_shading_region() {
+        // 2 pixels, tiny gradient → shading → reflectance should be flat
+        let log_luma = vec![(0.5f32 + 1e-6).ln(), (0.5001f32 + 1e-6).ln()];
+        let constraints = classify_gradients(&log_luma, 2, 1, 0.05);
+        let solution = solve_log_reflectance(&constraints, 2, 1e-6).expect("solver should succeed");
+        let diff = (solution[1] - solution[0]).abs();
+        assert!(diff < 1e-3, "reflectance should be smooth, diff = {diff}");
     }
 }
