@@ -42,6 +42,12 @@ pub enum RetinexError {
     EmptySigmaSet,
     /// A sigma value was not positive
     InvalidSigma(f32),
+    /// The sparse LDL^T factorization failed (gradient mode)
+    #[cfg(feature = "gradient")]
+    SolverFailed(String),
+    /// A threshold value was not positive (gradient mode)
+    #[cfg(feature = "gradient")]
+    InvalidThreshold(f32),
 }
 
 impl std::fmt::Display for RetinexError {
@@ -49,6 +55,12 @@ impl std::fmt::Display for RetinexError {
         match self {
             RetinexError::EmptySigmaSet => write!(f, "expected at least one sigma value"),
             RetinexError::InvalidSigma(value) => write!(f, "sigma must be positive, got {value}"),
+            #[cfg(feature = "gradient")]
+            RetinexError::SolverFailed(msg) => write!(f, "sparse solver failed: {msg}"),
+            #[cfg(feature = "gradient")]
+            RetinexError::InvalidThreshold(value) => {
+                write!(f, "threshold must be positive, got {value}")
+            }
         }
     }
 }
@@ -78,6 +90,19 @@ pub struct RetinexOutput {
     pub illumination: Rgb32FImage,
 }
 
+/// Output from gradient-based intrinsic image decomposition
+///
+/// Unlike [`RetinexOutput`], reflectance is in **linear space** ([0, 1])
+/// and directly displayable without normalization.
+#[cfg(feature = "gradient")]
+#[derive(Debug, Clone)]
+pub struct IntrinsicOutput {
+    /// Reflectance in linear space, values in [0, 1]
+    pub reflectance: Rgb32FImage,
+    /// Shading (illumination) in linear space, values in [0, 1]
+    pub shading: Rgb32FImage,
+}
+
 mod retinex;
 pub use retinex::{
     clamp_reflectance, extract_illumination, multi_scale_retinex,
@@ -85,3 +110,34 @@ pub use retinex::{
     normalize_reflectance, single_scale_retinex, single_scale_retinex_color_restored,
     single_scale_retinex_full, suggest_sigma, suggest_sigmas,
 };
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "gradient")]
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "gradient")]
+    fn test_intrinsic_output_fields_exist() {
+        let out = IntrinsicOutput {
+            reflectance: image::Rgb32FImage::new(1, 1),
+            shading: image::Rgb32FImage::new(1, 1),
+        };
+        assert_eq!(out.reflectance.dimensions(), (1, 1));
+        assert_eq!(out.shading.dimensions(), (1, 1));
+    }
+
+    #[test]
+    #[cfg(feature = "gradient")]
+    fn test_solver_failed_error_display() {
+        let e = RetinexError::SolverFailed("singular matrix".into());
+        assert!(e.to_string().contains("singular matrix"));
+    }
+
+    #[test]
+    #[cfg(feature = "gradient")]
+    fn test_invalid_threshold_error_display() {
+        let e = RetinexError::InvalidThreshold(-0.1);
+        assert!(e.to_string().contains("-0.1"));
+    }
+}
