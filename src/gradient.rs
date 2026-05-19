@@ -4,6 +4,47 @@ use crate::{EPSILON, IntrinsicOutput, RetinexError, RetinexResult};
 
 const DEFAULT_THRESHOLD: f32 = 0.05;
 
+struct Constraint {
+    p: usize, // "from" pixel index
+    q: usize, // "to" pixel index (always q > p)
+    rhs: f32, // 0.0 for shading; actual gradient for reflectance edge
+}
+
+fn classify_gradients(
+    log_luma: &[f32],
+    width: u32,
+    height: u32,
+    threshold: f32,
+) -> Vec<Constraint> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut constraints = Vec::with_capacity((w - 1) * h + w * (h - 1));
+
+    // Horizontal pairs: pixel (x,y) -> (x+1,y)
+    for y in 0..h {
+        for x in 0..(w - 1) {
+            let p = y * w + x;
+            let q = y * w + x + 1;
+            let g = log_luma[q] - log_luma[p];
+            let rhs = if g.abs() > threshold { g } else { 0.0 };
+            constraints.push(Constraint { p, q, rhs });
+        }
+    }
+
+    // Vertical pairs: pixel (x,y) -> (x,y+1)
+    for y in 0..(h - 1) {
+        for x in 0..w {
+            let p = y * w + x;
+            let q = (y + 1) * w + x;
+            let g = log_luma[q] - log_luma[p];
+            let rhs = if g.abs() > threshold { g } else { 0.0 };
+            constraints.push(Constraint { p, q, rhs });
+        }
+    }
+
+    constraints
+}
+
 pub fn gradient_intrinsic_decomp(
     _image: &DynamicImage,
     _threshold: Option<f32>,
@@ -51,5 +92,54 @@ mod tests {
         let img = Rgb32FImage::new(4, 3);
         let luma = to_log_luma(&img);
         assert_eq!(luma.len(), 12);
+    }
+
+    #[test]
+    fn test_classify_reflectance_edge() {
+        // Large gradient: dark (0.1) to bright (0.9) — should be reflectance edge
+        let log_luma = vec![(0.1f32 + 1e-6).ln(), (0.9f32 + 1e-6).ln()];
+        let constraints = classify_gradients(&log_luma, 2, 1, 0.05);
+        // g ≈ ln(0.9) - ln(0.1) ≈ 2.197, which is >> 0.05
+        assert_eq!(constraints.len(), 1);
+        let g = log_luma[1] - log_luma[0];
+        assert!(
+            (constraints[0].rhs - g).abs() < 1e-5,
+            "expected rhs={g}, got {}",
+            constraints[0].rhs
+        );
+    }
+
+    #[test]
+    fn test_classify_shading_region() {
+        // Tiny gradient: nearly equal values — should be shading (rhs = 0)
+        let log_luma = vec![(0.5f32 + 1e-6).ln(), (0.5001f32 + 1e-6).ln()];
+        let constraints = classify_gradients(&log_luma, 2, 1, 0.05);
+        assert_eq!(constraints.len(), 1);
+        assert!(
+            constraints[0].rhs.abs() < 1e-6,
+            "expected rhs=0, got {}",
+            constraints[0].rhs
+        );
+    }
+
+    #[test]
+    fn test_constraint_count_2x2() {
+        // 2x2 image: 2 horizontal pairs + 2 vertical pairs = 4 constraints
+        let log_luma = vec![0.0f32; 4];
+        let constraints = classify_gradients(&log_luma, 2, 2, 0.05);
+        assert_eq!(constraints.len(), 4);
+    }
+
+    #[test]
+    fn test_constraint_pixel_indices() {
+        // 3x1 image: two horizontal constraints
+        // pixels 0,1,2; constraint 0: p=0 q=1; constraint 1: p=1 q=2
+        let log_luma = vec![0.0f32; 3];
+        let constraints = classify_gradients(&log_luma, 3, 1, 0.05);
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(constraints[0].p, 0);
+        assert_eq!(constraints[0].q, 1);
+        assert_eq!(constraints[1].p, 1);
+        assert_eq!(constraints[1].q, 2);
     }
 }
