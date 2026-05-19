@@ -103,7 +103,11 @@ pub struct IntrinsicOutput {
     pub shading: Rgb32FImage,
 }
 
+#[cfg(feature = "gradient")]
+mod gradient;
 mod retinex;
+#[cfg(feature = "gradient")]
+pub use gradient::gradient_intrinsic_decomp;
 pub use retinex::{
     clamp_reflectance, extract_illumination, multi_scale_retinex,
     multi_scale_retinex_color_restored, multi_scale_retinex_full, normalize_per_channel,
