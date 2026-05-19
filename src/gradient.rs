@@ -118,7 +118,9 @@ fn reconstruct_color(
 
             for ch in 0..3 {
                 let r = (orig.0[ch] * ratio).clamp(0.0, 1.0);
-                let s = (orig.0[ch] / (r + EPSILON)).clamp(0.0, 1.0);
+                // Shading can exceed 1 in dark/low-reflectance regions; only prevent negatives.
+                // Clamping to 1 here would break the multiplicative identity I = R * S.
+                let s = (orig.0[ch] / (r + EPSILON)).max(0.0);
                 reflectance.get_pixel_mut(x, y).0[ch] = r;
                 shading.get_pixel_mut(x, y).0[ch] = s;
             }
