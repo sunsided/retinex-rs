@@ -1,6 +1,4 @@
 use image::{DynamicImage, Rgb32FImage};
-use sprs::TriMat;
-use sprs_ldl::Ldl;
 
 use crate::{EPSILON, IntrinsicOutput, RetinexError, RetinexResult};
 
@@ -47,46 +45,96 @@ fn classify_gradients(
     constraints
 }
 
-fn solve_log_reflectance(
-    constraints: &[Constraint],
-    n: usize,
-    lambda: f64,
-) -> RetinexResult<Vec<f64>> {
-    // Build A'A + λI directly as triplets (full symmetric matrix; sprs-ldl checks symmetry).
-    // For each constraint row with A[row,p]=-1, A[row,q]=+1 (q > p always):
-    //   A'A[p,p] += 1,  A'A[q,q] += 1,  A'A[q,p] = A'A[p,q] = -1
-    //   A'b[p] -= rhs,  A'b[q] += rhs
-    let mut ata: TriMat<f64> = TriMat::new((n, n));
-    let mut atb = vec![0.0f64; n];
-
-    // Tikhonov regularization: add λ to every diagonal entry
-    for i in 0..n {
-        ata.add_triplet(i, i, lambda);
-    }
-
+// Computes y = (A'A + λI) x matrix-free, in O(constraints) time.
+// A'A is the graph Laplacian: for each constraint (p,q), diagonal +1 each, off-diagonal -1.
+fn matvec(constraints: &[Constraint], lambda: f64, x: &[f64], y: &mut [f64]) {
+    y.iter_mut()
+        .zip(x.iter())
+        .for_each(|(yi, xi)| *yi = lambda * xi);
     for c in constraints {
-        let p = c.p;
-        let q = c.q; // q > p always (by construction in classify_gradients)
+        let diff = x[c.p] - x[c.q];
+        y[c.p] += diff;
+        y[c.q] -= diff;
+    }
+}
+
+#[inline]
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(ai, bi)| ai * bi).sum()
+}
+
+#[inline]
+fn axpy(alpha: f64, x: &[f64], y: &mut [f64]) {
+    y.iter_mut()
+        .zip(x.iter())
+        .for_each(|(yi, xi)| *yi += alpha * xi);
+}
+
+fn solve_log_reflectance(constraints: &[Constraint], n: usize, lambda: f64) -> Vec<f64> {
+    // Assemble A'b: for each constraint (p, q, rhs), A'b[p] -= rhs, A'b[q] += rhs.
+    let mut atb = vec![0.0f64; n];
+    for c in constraints {
         let rhs = c.rhs as f64;
-
-        ata.add_triplet(p, p, 1.0); // A'A[p,p] += 1
-        ata.add_triplet(q, q, 1.0); // A'A[q,q] += 1
-        // Off-diagonal entries (both triangles so the matrix is fully symmetric)
-        ata.add_triplet(q, p, -1.0); // lower triangle: row q > col p
-        ata.add_triplet(p, q, -1.0); // upper triangle: row p < col q
-
-        atb[p] -= rhs;
-        atb[q] += rhs;
+        atb[c.p] -= rhs;
+        atb[c.q] += rhs;
     }
 
-    // TriMat::to_csc() sums duplicate entries automatically (correct for accumulation above).
-    let ata_csc = ata.to_csc::<usize>();
+    let b_norm_sq = dot(&atb, &atb);
+    if b_norm_sq < f64::EPSILON {
+        return vec![0.0; n];
+    }
 
-    let ldl = Ldl::new()
-        .numeric(ata_csc.view())
-        .map_err(|_| RetinexError::SolverFailed("LDL factorization failed".into()))?;
+    // Jacobi (diagonal) preconditioner: M[i] = degree(i) + λ.
+    let mut diag = vec![lambda; n];
+    for c in constraints {
+        diag[c.p] += 1.0;
+        diag[c.q] += 1.0;
+    }
 
-    Ok(ldl.solve(&atb))
+    // Preconditioned conjugate gradient.
+    // With λ ≈ 1e-3, condition number ≈ 4/λ ≈ 4000 → ~300-500 iterations to converge.
+    let tol_sq = 1e-8 * b_norm_sq;
+    let max_iter = (n as f64).sqrt() as usize * 4 + 1000;
+
+    let mut x = vec![0.0f64; n];
+    let mut r = atb; // r₀ = b − A·0 = b
+    let mut z: Vec<f64> = r.iter().zip(diag.iter()).map(|(ri, di)| ri / di).collect();
+    let mut p = z.clone();
+    let mut rz = dot(&r, &z);
+
+    let mut ap = vec![0.0f64; n];
+
+    for _ in 0..max_iter {
+        ap.fill(0.0);
+        matvec(constraints, lambda, &p, &mut ap);
+
+        let pap = dot(&p, &ap);
+        if pap < 1e-14 {
+            break;
+        }
+
+        let alpha = rz / pap;
+        axpy(alpha, &p, &mut x);
+        axpy(-alpha, &ap, &mut r);
+
+        if dot(&r, &r) < tol_sq {
+            break;
+        }
+
+        z.iter_mut()
+            .zip(r.iter())
+            .zip(diag.iter())
+            .for_each(|((zi, ri), di)| *zi = ri / di);
+        let rz_new = dot(&r, &z);
+
+        let beta = rz_new / rz;
+        p.iter_mut()
+            .zip(z.iter())
+            .for_each(|(pi, zi)| *pi = zi + beta * *pi);
+        rz = rz_new;
+    }
+
+    x
 }
 
 fn enforce_physical_constraint(log_refl: &mut [f64]) {
@@ -145,7 +193,7 @@ pub fn gradient_intrinsic_decomp(
 
     let log_luma = to_log_luma(&rgb);
     let constraints = classify_gradients(&log_luma, width, height, threshold);
-    let mut log_refl = solve_log_reflectance(&constraints, n, 1e-6)?;
+    let mut log_refl = solve_log_reflectance(&constraints, n, 1e-3);
     enforce_physical_constraint(&mut log_refl);
 
     let (reflectance, shading) = reconstruct_color(&log_refl, &rgb, width, height);
@@ -253,7 +301,7 @@ mod tests {
         // Solution diff should ≈ log(0.8) - log(0.3)
         let log_luma = vec![(0.3f32 + 1e-6).ln(), (0.8f32 + 1e-6).ln()];
         let constraints = classify_gradients(&log_luma, 2, 1, 0.05);
-        let solution = solve_log_reflectance(&constraints, 2, 1e-6).expect("solver should succeed");
+        let solution = solve_log_reflectance(&constraints, 2, 1e-3);
         assert_eq!(solution.len(), 2);
         let diff = solution[1] - solution[0];
         let expected = (log_luma[1] - log_luma[0]) as f64;
@@ -268,7 +316,7 @@ mod tests {
         // 2 pixels, tiny gradient → shading → reflectance should be flat
         let log_luma = vec![(0.5f32 + 1e-6).ln(), (0.5001f32 + 1e-6).ln()];
         let constraints = classify_gradients(&log_luma, 2, 1, 0.05);
-        let solution = solve_log_reflectance(&constraints, 2, 1e-6).expect("solver should succeed");
+        let solution = solve_log_reflectance(&constraints, 2, 1e-3);
         let diff = (solution[1] - solution[0]).abs();
         assert!(diff < 1e-3, "reflectance should be smooth, diff = {diff}");
     }
