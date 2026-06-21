@@ -20,7 +20,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -45,7 +45,7 @@ jobs:
           - name: all features
             flags: --all-features
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
