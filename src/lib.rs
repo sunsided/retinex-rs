@@ -66,6 +66,9 @@ use imageproc::filter::gaussian_blur_f32;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 const EPSILON: f32 = 1e-6;
 const SIGMA_RATIOS: [f32; 3] = [0.030, 0.160, 0.500];
 const SIGMA_MIN: f32 = 2.0;
@@ -77,6 +80,9 @@ pub enum RetinexError {
     EmptySigmaSet,
     /// A sigma value was not positive
     InvalidSigma(f32),
+    /// GPU backend failed to initialize or execute (feature = "gpu")
+    #[cfg(feature = "gpu")]
+    Gpu(String),
 }
 
 impl std::fmt::Display for RetinexError {
@@ -84,6 +90,8 @@ impl std::fmt::Display for RetinexError {
         match self {
             RetinexError::EmptySigmaSet => write!(f, "expected at least one sigma value"),
             RetinexError::InvalidSigma(value) => write!(f, "sigma must be positive, got {value}"),
+            #[cfg(feature = "gpu")]
+            RetinexError::Gpu(reason) => write!(f, "gpu backend error: {reason}"),
         }
     }
 }
