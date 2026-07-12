@@ -43,7 +43,8 @@ pub fn single_scale_retinex_full_gpu(image: &DynamicImage, sigma: f32) -> Retine
     if sigma <= 0.0 {
         return Err(RetinexError::InvalidSigma(sigma));
     }
-    retinex_full_gpu(image, &[sigma])
+    let rgb = image.to_rgb32f();
+    retinex_full_gpu(&rgb, &[sigma])
 }
 
 /// Multi-scale Retinex on the GPU, returning both reflectance and illumination.
@@ -60,7 +61,8 @@ pub fn multi_scale_retinex_full_gpu(
     if let Some(&invalid) = sigmas.iter().find(|&&s| s <= 0.0) {
         return Err(RetinexError::InvalidSigma(invalid));
     }
-    retinex_full_gpu(image, sigmas)
+    let rgb = image.to_rgb32f();
+    retinex_full_gpu(&rgb, sigmas)
 }
 
 /// GPU counterpart of [`crate::single_scale_retinex_color_restored`].
@@ -68,8 +70,11 @@ pub fn single_scale_retinex_color_restored_gpu(
     image: &DynamicImage,
     sigma: f32,
 ) -> RetinexResult<image::RgbImage> {
+    if sigma <= 0.0 {
+        return Err(RetinexError::InvalidSigma(sigma));
+    }
     let rgb = image.to_rgb32f();
-    let output = single_scale_retinex_full_gpu(image, sigma)?;
+    let output = retinex_full_gpu(&rgb, &[sigma])?;
     let restored = crate::apply_color_restoration(&output.reflectance, &rgb);
     Ok(crate::float_to_rgb8(&restored))
 }
@@ -79,17 +84,25 @@ pub fn multi_scale_retinex_color_restored_gpu(
     image: &DynamicImage,
     sigmas: &[f32],
 ) -> RetinexResult<image::RgbImage> {
+    if sigmas.is_empty() {
+        return Err(RetinexError::EmptySigmaSet);
+    }
+    if let Some(&invalid) = sigmas.iter().find(|&&s| s <= 0.0) {
+        return Err(RetinexError::InvalidSigma(invalid));
+    }
     let rgb = image.to_rgb32f();
-    let output = multi_scale_retinex_full_gpu(image, sigmas)?;
+    let output = retinex_full_gpu(&rgb, sigmas)?;
     let restored = crate::apply_color_restoration(&output.reflectance, &rgb);
     Ok(crate::float_to_rgb8(&restored))
 }
 
-fn retinex_full_gpu(image: &DynamicImage, sigmas: &[f32]) -> RetinexResult<RetinexOutput> {
-    let rgb = image.to_rgb32f();
+// Takes an already-converted Rgb32FImage rather than a DynamicImage so
+// callers that also need the RGB buffer for color restoration (see the
+// _color_restored_gpu variants above) only pay for to_rgb32f() once.
+fn retinex_full_gpu(rgb: &Rgb32FImage, sigmas: &[f32]) -> RetinexResult<RetinexOutput> {
     let ctx = context()?;
     let (reflectance, illumination) = ctx
-        .run(&rgb, sigmas)
+        .run(rgb, sigmas)
         .map_err(|e| RetinexError::Gpu(e.to_string()))?;
     Ok(RetinexOutput {
         reflectance,
